@@ -508,7 +508,15 @@ func (c *Container) Restore(conf *config.Config, imagePath string, direct, backg
 	restore := func(conf *config.Config, spec *specs.Spec) error {
 		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, direct, background, networkArgs)
 	}
-	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
+	restoreSub := func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error {
+		if imagePath != "" && c.Sandbox.NoRootContainer {
+			if err := restore(conf, spec); err != nil {
+				return err
+			}
+		}
+		return c.Sandbox.RestoreSubcontainer(spec, conf, cid, stdios, goferFiles, goferFilestores, devIOFile, goferConfs)
+	}
+	return c.startImpl(conf, "restore", restore, restoreSub)
 }
 
 func (c *Container) startImpl(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {

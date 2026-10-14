@@ -565,31 +565,37 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
+	fromSubcontainer := !specutils.IsRootContainer(spec)
+	if imagePath == "" && (!s.NoRootContainer || fromSubcontainer || s.FSRestore) {
+		return fmt.Errorf("image-path is required except when preparing a no-root sandbox without split filesystem restore")
+	}
 
-	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
+	if imagePath != "" && !s.FSRestore && HasFSCheckpointManifest(imagePath) {
 		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
 	}
 
 	opt := boot.RestoreOpts{
-		Background:     background,
-		SplitFSRestore: s.FSRestore,
+		Background:       background,
+		SplitFSRestore:   s.FSRestore,
+		FromSubcontainer: fromSubcontainer,
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {
 			_ = f.Close()
 		}
 	}()
-	if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
-		return err
-	}
-
-	// If the platform needs a device FD we must pass it in.
-	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
-		return err
-	} else if deviceFile != nil {
-		defer deviceFile.Close()
-		opt.HaveDeviceFile = true
-		opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+	if imagePath != "" {
+		if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
+			return err
+		}
+		// Donate the platform device with the checkpoint, not during preparation.
+		if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
+			return err
+		} else if deviceFile != nil {
+			defer deviceFile.Close()
+			opt.HaveDeviceFile = true
+			opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+		}
 	}
 
 	conn, err := s.sandboxConnect()
@@ -598,23 +604,26 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 	defer conn.Close()
 
-	if networkArgs == nil {
-		var disableIPv6 bool
-		disableIPv6, err = getDisableIPv6(spec)
-		if err != nil {
-			return err
-		}
-		// Scrape the host network to get the network config and store it in the
-		// loader. The kernel will restore loaded network stack with this config.
-		if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
-			return fmt.Errorf("setting up network: %w", err)
-		}
-	} else {
-		// When network args is not nil, set it in the loader which will be used
-		// during restore to configure the loaded stack.
-		log.Debugf("Setting up network args, config: %+v", networkArgs)
-		if err := conn.Call(boot.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
-			return fmt.Errorf("setting network args: %w", err)
+	// Subcontainers reuse the network configuration captured during preparation.
+	if !fromSubcontainer {
+		if networkArgs == nil {
+			var disableIPv6 bool
+			disableIPv6, err = getDisableIPv6(spec)
+			if err != nil {
+				return err
+			}
+			// Scrape the host network to get the network config and store it in the
+			// loader. The kernel will restore loaded network stack with this config.
+			if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
+				return fmt.Errorf("setting up network: %w", err)
+			}
+		} else {
+			// When network args is not nil, set it in the loader which will be used
+			// during restore to configure the loaded stack.
+			log.Debugf("Setting up network args, config: %+v", networkArgs)
+			if err := conn.Call(boot.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
+				return fmt.Errorf("setting network args: %w", err)
+			}
 		}
 	}
 

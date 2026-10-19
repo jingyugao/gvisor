@@ -1,0 +1,95 @@
+name: Fork restore CI
+
+"on":
+  pull_request:
+    branches:
+      - "fork/**"
+      - "fix/restore-demand-wakeup"
+      - "feat/restore-demand-only-v2"
+  push:
+    branches:
+      - "fork/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  restore-validation:
+    if: >-
+      github.repository == 'jingyugao/gvisor' &&
+      (github.event_name != 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/fork/'))
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Install make
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y make
+
+    - name: Run restore regression tests
+      run: |
+        targets=(
+          //pkg/sentry/pgalloc:pgalloc_test
+          //pkg/sentry/kernel:kernel_test
+          //pkg/sentry/state/stateio:stateio_test
+          //pkg/aio:aio_test
+          //runsc/config:config_test
+          //runsc/boot:boot_test
+        )
+
+        # This target is optional because it may arrive in a separate fork PR.
+        build_file=
+        if [[ -f tools/checkpointprefetch/BUILD ]]; then
+          build_file=tools/checkpointprefetch/BUILD
+        elif [[ -f tools/checkpointprefetch/BUILD.bazel ]]; then
+          build_file=tools/checkpointprefetch/BUILD.bazel
+        fi
+        if [[ -n "$build_file" ]] && grep -Eq 'name[[:space:]]*=[[:space:]]*"checkpointprefetch_test"' "$build_file"; then
+          targets+=(//tools/checkpointprefetch:checkpointprefetch_test)
+        fi
+
+        make test OPTIONS="--jobs=2 --local_resources=memory=4096" TARGETS="${targets[*]}"
+
+    - name: Test deferred checkpoint restore when available
+      run: |
+        if grep -q 'awaitingCheckpoint' runsc/boot/loader.go; then
+          make test TARGETS=//runsc/container:container_test OPTIONS='--jobs=2 --local_resources=memory=4096 --test_filter="^TestCheckpointRestoreNoRootContainer(|FailedRestore|SplitFS)$$" --test_arg=--test_platforms=systrap --test_sharding_strategy=disabled'
+        fi
+
+    - name: Build release layout
+      run: |
+        mkdir -p artifacts/release
+        targets=(//:release)
+        if [[ -f tools/checkpointprefetch/main/BUILD ]]; then
+          targets+=(//tools/checkpointprefetch/main:checkpointprefetch)
+        fi
+        make copy OPTIONS="--jobs=2 --local_resources=memory=4096" TARGETS="${targets[*]}" DESTINATION=artifacts/release/
+
+    - name: Write build provenance and checksums
+      run: |
+        git rev-parse HEAD > artifacts/SOURCE_COMMIT
+        tar -C artifacts -czf artifacts/gvisor-release.tar.gz release
+        (cd artifacts && sha256sum gvisor-release.tar.gz > SHA256SUMS)
+        test -s artifacts/release/runsc
+        test -d artifacts/release/gvisor-bin
+        test -s artifacts/SOURCE_COMMIT
+        test -s artifacts/SHA256SUMS
+        test -s artifacts/gvisor-release.tar.gz
+
+    - name: Upload release layout
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: gvisor-release-${{ github.sha }}
+        path: |
+          artifacts/gvisor-release.tar.gz
+          artifacts/SOURCE_COMMIT
+          artifacts/SHA256SUMS

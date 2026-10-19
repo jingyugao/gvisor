@@ -132,6 +132,9 @@ func (c *controller) stop() {
 
 // containerManager manages sandbox containers.
 type containerManager struct {
+	// restoreInitMu serializes checkpoint initialization by subcontainers.
+	restoreInitMu sync.Mutex
+
 	// startChan is used to signal when the root container process should
 	// be started.
 	startChan chan struct{}
@@ -360,6 +363,8 @@ func (cm *containerManager) PortForward(opts *sentryapi.PortForwardOpts, _ *stru
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
 func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retErr error) {
+	cm.restoreInitMu.Lock()
+	defer cm.restoreInitMu.Unlock()
 	timer := starttime.Timer("Restore")
 	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
@@ -368,11 +373,32 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	cu := cleanup.Make(cm.l.mu.Unlock)
 	defer cu.Clean()
 
-	if cm.l.state != created {
+	if o.FromSubcontainer && cm.l.state == restoringUnstarted && cm.l.noRootContainer.enabled && len(o.Files) != 0 {
+		// Concurrent subcontainer restores in this sandbox must use the same
+		// checkpoint. Another subcontainer has initialized it, so this call can
+		// proceed to restore its container. The URPC server closes this call's
+		// unused file payload after the handler returns.
+		return nil
+	}
+	if cm.l.state != created && !(o.FromSubcontainer && cm.l.state == awaitingCheckpoint) {
 		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
 	}
-	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
+	if o.FromSubcontainer && cm.l.state == created {
+		return fmt.Errorf("sandbox must be prepared for restore before restoring a subcontainer")
+	}
 	cm.l.restoreReady = false
+	if len(o.Files) == 0 {
+		if o.FromSubcontainer || cm.l.state != created || !cm.l.noRootContainer.enabled || o.SplitFSRestore || cm.l.fsRestore != nil {
+			return fmt.Errorf("checkpoint files are required except when preparing a no-root sandbox without split filesystem restore")
+		}
+		cm.l.restoreDone = sync.NewCond(&cm.l.mu)
+		cm.l.state = awaitingCheckpoint
+		return nil
+	}
+	if cm.l.restoreDone == nil {
+		cm.l.restoreDone = sync.NewCond(&cm.l.mu)
+	}
+	cm.l.state = restoringUnstarted
 	defer func() {
 		if retErr != nil {
 			cu.Clean() // Release `cm.l.mu` as onRestoreFailed will acquire it.
@@ -391,10 +417,6 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	}
 	if o.SplitFSRestore && o.LazyPages != (cm.l.root.conf.RestorePageLoading == config.RestorePageLoadingLazy) {
 		return fmt.Errorf("split filesystem restore requires the same restore-page-loading mode used during sandbox creation")
-	}
-
-	if len(o.Files) == 0 {
-		return fmt.Errorf("at least one file must be passed to Restore")
 	}
 
 	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o)
@@ -449,8 +471,6 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	}
 	stateFile = nil
 	timer.Reached("created statefile reader")
-
-	cm.l.state = restoringUnstarted
 
 	// Release `cm.l.mu`.
 	cu.Clean()
@@ -623,9 +643,12 @@ func (cm *containerManager) onRestoreReady() {
 
 func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *struct{}) (retErr error) {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
+	// Do not observe partially initialized checkpoint readers or metadata.
+	cm.restoreInitMu.Lock()
 	cm.l.mu.Lock()
 	state := cm.l.state
 	cm.l.mu.Unlock()
+	cm.restoreInitMu.Unlock()
 	if state != restoringUnstarted {
 		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer: state=%s", state)
 	}

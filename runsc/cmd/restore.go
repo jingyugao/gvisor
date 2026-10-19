@@ -77,7 +77,7 @@ func (*Restore) Usage() string {
 // SetFlags implements subcommands.Command.SetFlags.
 func (r *Restore) SetFlags(f *flag.FlagSet) {
 	r.Create.SetFlags(f)
-	f.StringVar(&r.imagePath, "image-path", "", "directory path to saved container image")
+	f.StringVar(&r.imagePath, "image-path", "", "directory path to saved container image; may be omitted to prepare a no-root sandbox for a checkpoint supplied by a later subcontainer restore")
 	f.BoolVar(&r.detach, "detach", false, "detach from the container's process")
 	f.BoolVar(&r.direct, "direct", false, "use O_DIRECT for reading checkpoint pages file")
 	f.BoolVar(&r.background, "background", false, "allow image loading to continue after restore exits (requires uncompressed checkpoint)")
@@ -135,10 +135,6 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	if bundleDir == "" {
 		bundleDir = getwdOrDie()
 	}
-	if r.imagePath == "" {
-		return util.Errorf("image-path flag must be provided")
-	}
-
 	var cu cleanup.Cleanup
 	defer cu.Clean()
 
@@ -161,6 +157,9 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	if err != nil {
 		if err != os.ErrNotExist {
 			return util.Errorf("loading container: %v", err)
+		}
+		if r.imagePath == "" && (!r.noRootContainer || len(r.fsRestoreImagePaths) != 0) {
+			return util.Errorf("image-path may be omitted only when preparing a no-root sandbox without split filesystem restore")
 		}
 
 		log.Warningf("Container not found, creating new one, cid: %s, spec from: %s", id, bundleDir)
@@ -197,6 +196,9 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	}
 
 	log.Debugf("Restore: %v", r.imagePath)
+	if r.imagePath == "" && (!c.Sandbox.NoRootContainer || !specutils.IsRootContainer(c.Spec) || c.Sandbox.FSRestore) {
+		return util.Errorf("image-path may be omitted only when preparing a no-root sandbox without split filesystem restore")
+	}
 	err = c.Restore(conf, r.imagePath, r.direct, r.background, nil /* networkArgs */)
 	if err != nil {
 		return util.Errorf("starting container: %v", err)

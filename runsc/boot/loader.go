@@ -171,6 +171,9 @@ const (
 	// started indicates that the Loader has been started. This means that the
 	// root container is running. Subsequent containers may still be unstarted.
 	started
+	// awaitingCheckpoint is a no-root sandbox prepared for restore, before a
+	// subcontainer supplies the checkpoint. The kernel has not been restored.
+	awaitingCheckpoint
 	// restoringUnstarted indicates that the Loader has been created and is
 	// restoring containers, but not started yet.
 	restoringUnstarted
@@ -190,6 +193,8 @@ func (s loaderState) String() string {
 		return "created"
 	case started:
 		return "started"
+	case awaitingCheckpoint:
+		return "awaitingCheckpoint"
 	case restoringUnstarted:
 		return "restoringUnstarted"
 	case restoringStarted:
@@ -1957,7 +1962,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	l.mu.Lock()
 	state := l.state
-	if state == restoringUnstarted {
+	if state == awaitingCheckpoint || state == restoringUnstarted {
 		log.Infof("Waiting for the container to restore, CID: %q", cid)
 		l.restoreDone.Wait()
 		l.mu.Unlock()
@@ -2028,7 +2033,7 @@ func (l *Loader) waitRestore() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for l.state != restored && l.state != restoreFailed {
-		if l.state != restoringUnstarted && l.state != restoringStarted {
+		if l.state != awaitingCheckpoint && l.state != restoringUnstarted && l.state != restoringStarted {
 			return fmt.Errorf("sandbox is not being restored, cannot wait for restore: state=%s", l.state)
 		}
 		l.restoreDone.Wait()
@@ -2041,7 +2046,7 @@ func (l *Loader) waitRestoreReady() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for !l.restoreReady && l.state != restored && l.state != restoreFailed {
-		if l.state != restoringUnstarted && l.state != restoringStarted {
+		if l.state != awaitingCheckpoint && l.state != restoringUnstarted && l.state != restoringStarted {
 			return fmt.Errorf("sandbox is not being restored, cannot wait for restore readiness: state=%s", l.state)
 		}
 		l.restoreDone.Wait()

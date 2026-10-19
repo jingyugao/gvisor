@@ -122,6 +122,9 @@ type RestoreOpts struct {
 	HaveDeviceFile bool
 	Background     bool
 	LazyPages      bool `json:"lazy_pages"`
+	// FromSubcontainer identifies a restore request issued while restoring a
+	// subcontainer in a no-root sandbox.
+	FromSubcontainer bool
 
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing

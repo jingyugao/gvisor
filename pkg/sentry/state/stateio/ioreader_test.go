@@ -19,11 +19,52 @@ import (
 	"io"
 	"math/bits"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
+
+func TestCompletionWaitInterruptPreservesReadyCompletions(t *testing.T) {
+	completions := make(chan Completion, 2)
+	completions <- Completion{ID: 1, N: 4096}
+	wake := make(chan struct{}, 1)
+	wake <- struct{}{} // Covers a wake arriving before the wait starts.
+	cs, interrupted, err := CompletionChanWaitInterruptible(completions, []Completion{{ID: 9}}, 2, wake)
+	if err != nil || !interrupted || len(cs) != 2 || cs[0].ID != 9 || cs[1].ID != 1 {
+		t.Fatalf("interruptible wait = (%v, %t, %v), want prefix and ready completion", cs, interrupted, err)
+	}
+	completions <- Completion{ID: 2, N: 4096}
+	cs, err = CompletionChanWait(completions, nil, 1)
+	if err != nil || len(cs) != 1 || cs[0].ID != 2 {
+		t.Fatalf("subsequent wait = (%v, %v), want only completion 2", cs, err)
+	}
+}
+
+func TestCompletionWaitWithoutInterruptHonorsMinimum(t *testing.T) {
+	completions := make(chan Completion)
+	result := make(chan []Completion, 1)
+	go func() {
+		cs, _, _ := CompletionChanWaitInterruptible(completions, nil, 2, nil)
+		result <- cs
+	}()
+	completions <- Completion{ID: 1}
+	select {
+	case cs := <-result:
+		t.Fatalf("wait returned before two completions: %v", cs)
+	default:
+	}
+	completions <- Completion{ID: 2}
+	select {
+	case cs := <-result:
+		if len(cs) != 2 || cs[0].ID != 1 || cs[1].ID != 2 {
+			t.Fatalf("wait completions = %v", cs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wait did not return after its minimum was satisfied")
+	}
+}
 
 func TestIOReaderRead(t *testing.T) {
 	// Create random data.

@@ -114,6 +114,16 @@ func (r *foregroundObservedPageReader) WaitInterruptible(cs []stateio.Completion
 // checkpoint reader still has capacity. This models private MF metadata becoming
 // available after main MF page loading has started.
 func TestAsyncPageLoadForegroundWithSpareCapacity(t *testing.T) {
+	for name, opts := range map[string]AsyncPagesFileLoadOpts{
+		"background":  {},
+		"demand-only": {DisableBackground: true},
+	} {
+		t.Run(name, func(t *testing.T) { testForegroundWithSpareCapacity(t, opts) })
+	}
+}
+
+func testForegroundWithSpareCapacity(t *testing.T, pageLoadOpts AsyncPagesFileLoadOpts) {
+	t.Helper()
 	pageSize := uint64(hostarch.PageSize)
 	fr := memmap.FileRange{Start: 0, End: pageSize}
 	want := bytes.Repeat([]byte{0x5a}, int(pageSize))
@@ -193,12 +203,13 @@ func TestAsyncPageLoadForegroundWithSpareCapacity(t *testing.T) {
 	loader, err := StartAsyncPagesFileLoad(reader, func(err error) {
 		loadErr = err
 		close(loadDone)
-	}, nil)
+	}, nil, pageLoadOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	accessDone := make(chan struct{})
 	var accessStarted bool
+	var mainAccessDone chan error
 	t.Cleanup(func() {
 		// Release the blocked I/O even when an assertion fails, before any MF
 		// references or mappings are released.
@@ -219,12 +230,29 @@ func TestAsyncPageLoadForegroundWithSpareCapacity(t *testing.T) {
 				t.Error("timed out waiting for foreground access cleanup")
 			}
 		}
+		if mainAccessDone != nil {
+			select {
+			case err := <-mainAccessDone:
+				if err != nil {
+					t.Errorf("main demand access failed: %v", err)
+				}
+			case <-time.After(foregroundWaitTestTimeout):
+				t.Error("timed out waiting for main demand access cleanup")
+			}
+		}
 	})
 	opts := LoadOpts{PagesFile: loader}
 	if err := mainMF.LoadFrom(context.Background(), bytes.NewReader(metadata.Bytes()), &opts); err != nil {
 		t.Fatal(err)
 	}
 	mainLoaded = true
+	if pageLoadOpts.DisableBackground {
+		mainAccessDone = make(chan error, 1)
+		go func() {
+			_, err := mainMF.MapInternal(fr, hostarch.Read)
+			mainAccessDone <- err
+		}()
+	}
 	select {
 	case inflight := <-reader.firstWait:
 		if inflight != 1 || reader.MaxParallel() != 2 {

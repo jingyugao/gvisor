@@ -681,6 +681,7 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 	// checkpoint succeeded. Allow the application to proceed while pages may
 	// keep loading in the background.
 	k.IncCheckpointGenOnRestore()
+	r.cm.onRestoreReady()
 
 	// Wait for page loading to complete if happening in the background.
 	if r.asyncMFLoader != nil {

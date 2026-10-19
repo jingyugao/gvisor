@@ -127,6 +127,45 @@ func TestFromFlags(t *testing.T) {
 	}
 }
 
+func TestRestorePageLoadingFlagRoundTrip(t *testing.T) {
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(flagSet)
+	cfg, err := NewFromFlags(flagSet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.RestorePageLoading, RestorePageLoadingEager; got != want {
+		t.Fatalf("default RestorePageLoading=%v, want %v", got, want)
+	}
+	if err := flagSet.Lookup("restore-page-loading").Value.Set("lazy"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = NewFromFlags(flagSet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.RestorePageLoading, RestorePageLoadingLazy; got != want {
+		t.Fatalf("RestorePageLoading=%v, want %v", got, want)
+	}
+
+	serialized := cfg.ToFlags()
+	if !strings.Contains(strings.Join(serialized, " "), "--restore-page-loading=lazy") {
+		t.Fatalf("ToFlags()=%v, want --restore-page-loading=lazy", serialized)
+	}
+	parsedFlags := flag.NewFlagSet("round-trip", flag.ContinueOnError)
+	RegisterFlags(parsedFlags)
+	if err := parsedFlags.Parse(serialized); err != nil {
+		t.Fatalf("Parse(ToFlags()) failed: %v", err)
+	}
+	parsedCfg, err := NewFromFlags(parsedFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := parsedCfg.RestorePageLoading, RestorePageLoadingLazy; got != want {
+		t.Errorf("round-tripped RestorePageLoading=%v, want %v", got, want)
+	}
+}
+
 func TestToFlagsFromFlags(t *testing.T) {
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(testFlags)
@@ -275,6 +314,11 @@ func TestInvalidFlags(t *testing.T) {
 			name:  "host-fifo",
 			value: "invalid",
 			error: "invalid host fifo",
+		},
+		{
+			name:  "restore-page-loading",
+			value: "invalid",
+			error: "invalid restore page loading mode",
 		},
 		{
 			name:  "overlay2",

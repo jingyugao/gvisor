@@ -207,6 +207,7 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "demand_restore_test.go",
         "foreground_wait_test.go",
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
@@ -215,6 +216,7 @@ go_test(
     embed = [":pgalloc"],
     deps = [
         "//pkg/context",
+        "//pkg/errors/linuxerr",
         "//pkg/hostarch",
         "//pkg/memutil",
         "//pkg/safemem",

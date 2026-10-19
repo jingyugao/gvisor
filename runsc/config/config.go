@@ -447,6 +447,9 @@ type Config struct {
 	// performed during restore.
 	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
 
+	// RestorePageLoading controls how checkpoint pages are loaded during restore.
+	RestorePageLoading RestorePageLoading `flag:"restore-page-loading"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -1534,6 +1537,53 @@ var releaseVersionRE = regexp.MustCompile(`^(?:release|g[a-z]*)-\d{8}(?:\.\d+)?$
 // IsReleaseVersion returns whether ver is a tagged-release version string.
 func IsReleaseVersion(ver string) bool {
 	return releaseVersionRE.MatchString(ver)
+}
+
+// RestorePageLoading controls how checkpoint pages are loaded during restore.
+type RestorePageLoading int
+
+// RestorePageLoading values.
+const (
+	// RestorePageLoadingEager enables background loading of checkpoint pages.
+	RestorePageLoadingEager RestorePageLoading = iota
+
+	// RestorePageLoadingLazy loads checkpoint pages only when accessed.
+	RestorePageLoadingLazy
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *RestorePageLoading) Set(v string) error {
+	switch v {
+	case "eager":
+		*p = RestorePageLoadingEager
+	case "lazy":
+		*p = RestorePageLoadingLazy
+	default:
+		return fmt.Errorf("invalid restore page loading mode %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to p. Useful in flag declaration.
+func (p RestorePageLoading) Ptr() *RestorePageLoading {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *RestorePageLoading) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p RestorePageLoading) String() string {
+	switch p {
+	case RestorePageLoadingEager:
+		return "eager"
+	case RestorePageLoadingLazy:
+		return "lazy"
+	default:
+		panic(fmt.Sprintf("invalid restore page loading mode %d", p))
+	}
 }
 
 // RestoreSpecValidationPolicy dictates how spec validation should be handled.

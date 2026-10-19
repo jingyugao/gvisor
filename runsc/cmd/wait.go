@@ -41,6 +41,7 @@ type Wait struct {
 	pid          int
 	checkpoint   bool
 	restore      bool
+	restoreReady bool
 	fsCheckpoint bool
 	fsRestore    bool
 }
@@ -66,6 +67,7 @@ func (wt *Wait) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&wt.pid, "pid", unsetPID, "select a PID in the container's PID namespace to wait on instead of the container's root process")
 	f.BoolVar(&wt.checkpoint, "checkpoint", false, "wait for the next checkpoint to complete")
 	f.BoolVar(&wt.restore, "restore", false, "wait for the restore to complete")
+	f.BoolVar(&wt.restoreReady, "restore-ready", false, "wait until restored application tasks can run; checkpoint pages may still be unloaded")
 	f.BoolVar(&wt.fsCheckpoint, "fscheckpoint", false, "wait for the next filesystem checkpoint to complete")
 	f.BoolVar(&wt.fsRestore, "fsrestore", false, "wait for the filesystem restore to complete")
 }
@@ -90,8 +92,8 @@ func (wt *Wait) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	if wt.rootPID != unsetPID && wt.pid != unsetPID {
 		util.Fatalf("only one of -pid and -rootPid can be set")
 	}
-	if b2i(wt.checkpoint)+b2i(wt.restore)+b2i(wt.fsCheckpoint)+b2i(wt.fsRestore) > 1 {
-		util.Fatalf("at most one of -checkpoint, -restore, -fscheckpoint, -fsrestore may be set")
+	if b2i(wt.checkpoint)+b2i(wt.restore)+b2i(wt.restoreReady)+b2i(wt.fsCheckpoint)+b2i(wt.fsRestore) > 1 {
+		util.Fatalf("at most one of -checkpoint, -restore, -restore-ready, -fscheckpoint, -fsrestore may be set")
 	}
 
 	conf := args[0].(*config.Config)
@@ -111,11 +113,15 @@ func (wt *Wait) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		return subcommands.ExitSuccess
 	}
 
-	if wt.restore {
+	if wt.restore || wt.restoreReady {
 		if wt.rootPID != unsetPID || wt.pid != unsetPID {
 			log.Warningf("waiting for restore to complete, ignoring -pid and -rootpid")
 		}
-		if err := c.WaitRestore(); err != nil {
+		wait := c.WaitRestore
+		if wt.restoreReady {
+			wait = c.WaitRestoreReady
+		}
+		if err := wait(); err != nil {
 			util.Fatalf("waiting for restore to complete: %v", err)
 		}
 		return subcommands.ExitSuccess

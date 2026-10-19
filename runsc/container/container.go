@@ -790,6 +790,15 @@ func (c *Container) WaitRestore() error {
 	return c.Sandbox.WaitRestore()
 }
 
+// WaitRestoreReady waits until the restored application can run, without
+// waiting for every checkpoint page to be loaded.
+func (c *Container) WaitRestoreReady() error {
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
+	}
+	return c.Sandbox.WaitRestoreReady()
+}
+
 // WaitFSCheckpoint waits for a filesystem checkpoint to have successfully been
 // saved.
 func (c *Container) WaitFSCheckpoint() error {

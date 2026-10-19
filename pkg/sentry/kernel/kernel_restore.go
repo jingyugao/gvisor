@@ -374,18 +374,21 @@ type privateMFsInfo struct {
 // If timeline is provided, it will be used to track async page loading.
 // It takes ownership of the timeline, and will end it when done loading all
 // pages.
-func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
+// pageLoadOpts controls whether pages without waiters are loaded in the
+// background. With background loading disabled, Wait may block indefinitely
+// until all pages have been accessed or discarded.
+func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline, pageLoadOpts pgalloc.AsyncPagesFileLoadOpts) *AsyncMFLoader {
 	mfl := &AsyncMFLoader{
 		privateMFsChan: make(chan privateMFsInfo, 1),
 	}
 	mfl.mainMFStartWg.Add(1)
 	mfl.metadataWg.Add(1)
 	mfl.loadWg.Add(1)
-	go mfl.backgroundGoroutine(pagesMetadata, pagesFile, mainMF, timeline)
+	go mfl.backgroundGoroutine(pagesMetadata, pagesFile, mainMF, timeline, pageLoadOpts)
 	return mfl
 }
 
-func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) {
+func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline, pageLoadOpts pgalloc.AsyncPagesFileLoadOpts) {
 	defer timeline.End()
 	defer pagesMetadata.Close()
 	cu := cleanup.Make(func() {
@@ -398,7 +401,7 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	apfl, err := pgalloc.StartAsyncPagesFileLoad(pagesFile, func(err error) {
 		defer mfl.loadWg.Done()
 		mfl.loadErr = err
-	}, timeline) // transfers ownership of pagesFile
+	}, timeline, pageLoadOpts) // transfers ownership of pagesFile
 	if err != nil {
 		mfl.loadWg.Done()
 		mfl.mainMetadataErr = err

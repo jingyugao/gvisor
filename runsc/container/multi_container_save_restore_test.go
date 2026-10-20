@@ -1705,28 +1705,76 @@ func restoreNoRootContainer(t *testing.T, conf *config.Config, imagePath, sbID s
 // sbSpec, then restores subSpecs in checkpoint order.
 func restoreSandbox(t *testing.T, conf *config.Config, imagePath string, sbSpec *specs.Spec, sbID string, noRootContainer, background bool, subSpecs []*specs.Spec) (*Container, []*Container) {
 	t.Helper()
+	return restoreSandboxWithDeferredCheckpoint(t, conf, imagePath, sbSpec, sbID, noRootContainer, background, false, subSpecs)
+}
 
-	restoreOne := func(spec *specs.Spec, id string, noRootContainer bool) *Container {
+// restoreSandboxWithDeferredCheckpoint optionally starts a no-root sandbox
+// normally before supplying imagePath with the first restored subcontainer.
+func restoreSandboxWithDeferredCheckpoint(t *testing.T, conf *config.Config, imagePath string, sbSpec *specs.Spec, sbID string, noRootContainer, background, deferred bool, subSpecs []*specs.Spec) (*Container, []*Container) {
+	t.Helper()
+
+	newContainer := func(spec *specs.Spec, id string, noRootContainer bool) (*Container, string) {
 		t.Helper()
 		bundle, cleanupBundle, err := testutil.SetupBundleDir(spec)
 		if err != nil {
 			t.Fatalf("error setting up bundle: %v", err)
 		}
 		t.Cleanup(cleanupBundle)
-		c, err := New(conf, Args{ID: id, Spec: spec, BundleDir: bundle, CheckpointDirPath: imagePath, NoRootContainer: noRootContainer})
+		path := imagePath
+		if deferred && noRootContainer {
+			path = ""
+		}
+		c, err := New(conf, Args{ID: id, Spec: spec, BundleDir: bundle, CheckpointDirPath: path, NoRootContainer: noRootContainer})
 		if err != nil {
 			t.Fatalf("error creating container %q: %v", id, err)
 		}
 		t.Cleanup(func() { c.Destroy() })
-		if err := c.Restore(conf, imagePath, false /* direct */, background, nil /* networkArgs */); err != nil {
+		return c, path
+	}
+	restoreOne := func(spec *specs.Spec, id string, noRootContainer bool) *Container {
+		c, path := newContainer(spec, id, noRootContainer)
+		if deferred && noRootContainer {
+			if err := c.Start(conf); err != nil {
+				t.Fatalf("error starting no-root sandbox %q: %v", id, err)
+			}
+		} else if err := c.Restore(conf, path, false /* direct */, background, nil /* networkArgs */); err != nil {
 			t.Fatalf("error restoring container %q: %v", id, err)
+		}
+		if deferred && noRootContainer && c.Sandbox.Restored {
+			t.Fatalf("sandbox %q reports restored before a checkpoint was supplied", id)
 		}
 		return c
 	}
 	sb := restoreOne(sbSpec, sbID, noRootContainer)
 	var subs []*Container
-	for _, spec := range subSpecs {
-		subs = append(subs, restoreOne(spec, testutil.RandomContainerID(), false /* noRootContainer */))
+	if deferred {
+		for _, spec := range subSpecs {
+			c, _ := newContainer(spec, testutil.RandomContainerID(), false /* noRootContainer */)
+			subs = append(subs, c)
+		}
+		errs := make(chan error, len(subs))
+		for _, c := range subs {
+			go func(c *Container) {
+				errs <- c.Restore(conf, imagePath, false /* direct */, background, nil /* networkArgs */)
+			}(c)
+		}
+		var restoreErr error
+		for range subs {
+			if err := <-errs; err != nil && restoreErr == nil {
+				restoreErr = err
+			}
+		}
+		if restoreErr != nil {
+			t.Fatalf("error concurrently restoring subcontainers: %v", restoreErr)
+		}
+	} else {
+		for _, spec := range subSpecs {
+			c, _ := newContainer(spec, testutil.RandomContainerID(), false /* noRootContainer */)
+			if err := c.Restore(conf, imagePath, false /* direct */, background, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container %q: %v", c.ID, err)
+			}
+			subs = append(subs, c)
+		}
 	}
 	if err := sb.WaitRestore(); err != nil {
 		t.Fatalf("error waiting for restore: %v", err)
@@ -1756,7 +1804,25 @@ func checkpointNoRootContainer(t *testing.T, conf *config.Config, sb *Container,
 // TestCheckpointRestoreNoRootContainer checkpoints a sandbox booted with no
 // root container and restores it into a new one.
 func TestCheckpointRestoreNoRootContainer(t *testing.T) {
-	conf := testutil.TestConfig(t)
+	for platform, conf := range configs(t, true /* noOverlay */) {
+		t.Run(platform, func(t *testing.T) {
+			for _, network := range []config.NetworkType{config.NetworkNone, config.NetworkHost} {
+				for _, background := range []bool{false, true} {
+					for _, deferred := range []bool{false, true} {
+						t.Run(fmt.Sprintf("network=%s/background=%t/deferred=%t", network, background, deferred), func(t *testing.T) {
+							testConf := *conf
+							testConf.Network = network
+							testCheckpointRestoreNoRootContainer(t, &testConf, background, deferred)
+						})
+					}
+				}
+			}
+		})
+	}
+}
+
+func testCheckpointRestoreNoRootContainer(t *testing.T, conf *config.Config, background, deferred bool) {
+	t.Helper()
 	setupTestRootDir(t, conf)
 
 	dir := checkpointDir(t)
@@ -1773,15 +1839,19 @@ func TestCheckpointRestoreNoRootContainer(t *testing.T) {
 	sbID := testutil.RandomContainerID()
 	sb := startNoRootContainerSandbox(t, conf, sbID)
 	var subs []*Container
-	for _, args := range subArgs {
-		subs = append(subs, startNoRootContainerSubWithArgs(t, conf, sbID, nil /* pidnsPath */, args...))
+	var sourceSubSpecs []*specs.Spec
+	for i, args := range subArgs {
+		spec := noRootContainerSubSpec(sbID, args...)
+		spec.Annotations[specutils.ContainerdContainerNameAnnotation] = fmt.Sprintf("sub-%d", i)
+		sourceSubSpecs = append(sourceSubSpecs, spec)
+		subs = append(subs, startNoRootContainerSubWithSpec(t, conf, spec))
 	}
 	if err := waitForFileNotEmpty(outputFile); err != nil {
 		t.Fatalf("Failed to wait for output file: %v", err)
 	}
 	sleeperPID := onlyPID(t, subs[1])
 
-	checkpointNoRootContainer(t, conf, sb, dir, sandbox.CheckpointOpts{})
+	checkpointNoRootContainer(t, conf, sb, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone})
 	lastNum, err := readOutputNum(outputPath, -1)
 	if err != nil {
 		t.Fatalf("error with outputFile: %v", err)
@@ -1810,17 +1880,19 @@ func TestCheckpointRestoreNoRootContainer(t *testing.T) {
 		}
 		defer c.Destroy()
 		const want = "no-root-container=true cannot be restored with no-root-container=false"
-		if err := c.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err == nil || !strings.Contains(err.Error(), want) {
+		if err := c.Restore(conf, dir, false /* direct */, background, nil /* networkArgs */); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Restore() = %v, want error containing %q", err, want)
 		}
 	})
 
 	newSbID := testutil.RandomContainerID()
 	var subSpecs []*specs.Spec
-	for _, args := range subArgs {
-		subSpecs = append(subSpecs, noRootContainerSubSpec(newSbID, args...))
+	for i, sourceSpec := range sourceSubSpecs {
+		spec := noRootContainerSubSpec(newSbID, sourceSpec.Process.Args...)
+		spec.Annotations[specutils.ContainerdContainerNameAnnotation] = fmt.Sprintf("sub-%d", i)
+		subSpecs = append(subSpecs, spec)
 	}
-	sb2, subs2 := restoreNoRootContainer(t, conf, dir, newSbID, subSpecs)
+	sb2, subs2 := restoreSandboxWithDeferredCheckpoint(t, conf, dir, noRootContainerSandboxSpec(), newSbID, true, background, deferred, subSpecs)
 
 	// The counter picks up where it left off.
 	if err := waitForFileNotEmpty(outputFile2); err != nil {
@@ -1987,11 +2059,18 @@ func TestCheckpointRestoreRootContainerIntoNoRootContainer(t *testing.T) {
 	}
 }
 
-// TestCheckpointRestoreNoRootContainerFailedRestore checks that waiting on a
-// sandbox with no root container reports a failed restore as a root container
-// does.
+// TestCheckpointRestoreNoRootContainerFailedRestore checks that a deferred
+// no-root restore failure wakes sandbox waiters and reports a failed status.
 func TestCheckpointRestoreNoRootContainerFailedRestore(t *testing.T) {
-	conf := testutil.TestConfig(t)
+	for platform, conf := range configs(t, true /* noOverlay */) {
+		t.Run(platform, func(t *testing.T) {
+			testCheckpointRestoreNoRootContainerFailedRestore(t, conf)
+		})
+	}
+}
+
+func testCheckpointRestoreNoRootContainerFailedRestore(t *testing.T, conf *config.Config) {
+	t.Helper()
 	setupTestRootDir(t, conf)
 	conf.RestoreSpecValidation = config.RestoreSpecValidationEnforce
 
@@ -2002,32 +2081,28 @@ func TestCheckpointRestoreNoRootContainerFailedRestore(t *testing.T) {
 	startNoRootContainerSub(t, conf, sbID, nil /* pidnsPath */)
 	checkpointNoRootContainer(t, conf, sb, dir, sandbox.CheckpointOpts{})
 
-	restore := func(spec *specs.Spec, id string, noRootContainer bool) (*Container, error) {
+	restore := func(spec *specs.Spec, id string, noRootContainer bool, imagePath string) (*Container, error) {
 		t.Helper()
 		bundle, cleanupBundle, err := testutil.SetupBundleDir(spec)
 		if err != nil {
 			t.Fatalf("error setting up bundle: %v", err)
 		}
 		t.Cleanup(cleanupBundle)
-		c, err := New(conf, Args{ID: id, Spec: spec, BundleDir: bundle, CheckpointDirPath: dir, NoRootContainer: noRootContainer})
+		c, err := New(conf, Args{ID: id, Spec: spec, BundleDir: bundle, CheckpointDirPath: imagePath, NoRootContainer: noRootContainer})
 		if err != nil {
 			t.Fatalf("error creating container %q: %v", id, err)
 		}
 		t.Cleanup(func() { c.Destroy() })
-		return c, c.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */)
+		if noRootContainer && imagePath == "" {
+			return c, c.Start(conf)
+		}
+		return c, c.Restore(conf, imagePath, false /* direct */, false /* background */, nil /* networkArgs */)
 	}
 	newSbID := testutil.RandomContainerID()
-	sb2, err := restore(noRootContainerSandboxSpec(), newSbID, true /* noRootContainer */)
+	sb2, err := restore(noRootContainerSandboxSpec(), newSbID, true /* noRootContainer */, "" /* imagePath */)
 	if err != nil {
 		t.Fatalf("error restoring sandbox: %v", err)
 	}
-	// A changed spec fails restore validation.
-	spec := noRootContainerSubSpec(newSbID, sleepCmd...)
-	spec.Process.Cwd = "/tmp"
-	if _, err := restore(spec, testutil.RandomContainerID(), false /* noRootContainer */); err == nil {
-		t.Fatalf("restoring a container with a changed spec succeeded, want error")
-	}
-
 	waiter, err := Load(conf.RootDir, FullID{ContainerID: newSbID}, LoadOpts{})
 	if err != nil {
 		t.Fatalf("error loading sandbox: %v", err)
@@ -2039,10 +2114,36 @@ func TestCheckpointRestoreNoRootContainerFailedRestore(t *testing.T) {
 		ws, err = waiter.Wait()
 		waitC <- err
 	}()
-	// Let the wait reach the sandbox before it goes away.
-	time.Sleep(2 * time.Second)
-	if err := sb2.Destroy(); err != nil {
-		t.Fatalf("error destroying sandbox: %v", err)
+	// Restore waiters should observe failures independently of process exit.
+	// Sandbox.Wait also waits for the host Sentry to exit, so it completes
+	// after the graceful shutdown below.
+	restoreWait := make(chan error, 1)
+	go func() { restoreWait <- waiter.WaitRestore() }()
+	// Let the RPCs enter their waits while the checkpoint is outstanding.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-restoreWait:
+		t.Fatalf("restore waiter finished before checkpoint binding: %v", err)
+	default:
+	}
+	// A changed spec fails restore validation and must wake restore waiters.
+	spec := noRootContainerSubSpec(newSbID, sleepCmd...)
+	spec.Process.Cwd = "/tmp"
+	if _, err := restore(spec, testutil.RandomContainerID(), false /* noRootContainer */, dir); err == nil {
+		t.Fatalf("restoring a container with a changed spec succeeded, want error")
+	}
+	select {
+	case err := <-restoreWait:
+		if err == nil {
+			t.Fatal("restore waiter succeeded after deferred restore failed")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("restore waiter blocked after deferred restore failed")
+	}
+	// Stop gracefully so the Wait RPC can return the restore failure before
+	// the Sentry exits. Destroy would SIGKILL it and race the RPC response.
+	if err := unix.Kill(sb2.SandboxPid(), unix.SIGTERM); err != nil {
+		t.Fatalf("error stopping sandbox: %v", err)
 	}
 	select {
 	case err := <-waitC:
@@ -2206,7 +2307,15 @@ func TestCheckpointRestoreNoRootContainerPIDNamespace(t *testing.T) {
 // root container restores container filesystems from a split filesystem
 // checkpoint.
 func TestCheckpointRestoreNoRootContainerSplitFS(t *testing.T) {
-	conf := testutil.TestConfig(t)
+	for platform, conf := range configs(t, true /* noOverlay */) {
+		t.Run(platform, func(t *testing.T) {
+			testCheckpointRestoreNoRootContainerSplitFS(t, conf)
+		})
+	}
+}
+
+func testCheckpointRestoreNoRootContainerSplitFS(t *testing.T, conf *config.Config) {
+	t.Helper()
 	setupTestRootDir(t, conf)
 	conf.Overlay2.Set("root:self")
 
@@ -2225,6 +2334,58 @@ func TestCheckpointRestoreNoRootContainerSplitFS(t *testing.T) {
 		SplitFSCheckpointPaths: []string{fscheckpoint.AllTmpfsPath},
 	})
 	checkFSCheckpointFiles(t, dir, checkpointfiles.FSCheckpointDir)
+
+	newSub := func(sbID string) *Container {
+		t.Helper()
+		spec := testAppNoRootContainerSubSpec(t, sbID)
+		bundle, cleanupBundle, err := testutil.SetupBundleDir(spec)
+		if err != nil {
+			t.Fatalf("error setting up subcontainer bundle: %v", err)
+		}
+		t.Cleanup(cleanupBundle)
+		c, err := New(conf, Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundle})
+		if err != nil {
+			t.Fatalf("error creating subcontainer: %v", err)
+		}
+		t.Cleanup(func() { c.Destroy() })
+		return c
+	}
+
+	// Filesystem snapshots supplied at creation can be used even when the
+	// sandbox starts normally and the first subcontainer supplies sentry state.
+	deferredID := testutil.RandomContainerID()
+	deferredSpec := noRootContainerSandboxSpec()
+	bundle, cleanupBundle, err := testutil.SetupBundleDir(deferredSpec)
+	if err != nil {
+		t.Fatalf("error setting up deferred sandbox bundle: %v", err)
+	}
+	defer cleanupBundle()
+	deferred, err := New(conf, Args{ID: deferredID, Spec: deferredSpec, BundleDir: bundle, CheckpointDirPath: dir, NoRootContainer: true})
+	if err != nil {
+		t.Fatalf("error creating deferred sandbox: %v", err)
+	}
+	defer deferred.Destroy()
+	if err := deferred.Start(conf); err != nil {
+		t.Fatalf("error starting sandbox with filesystem restore: %v", err)
+	}
+	deferredSub := newSub(deferredID)
+	if err := deferredSub.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring subcontainer after sandbox start: %v", err)
+	}
+	if err := deferred.WaitRestore(); err != nil {
+		t.Fatalf("error waiting for deferred restore: %v", err)
+	}
+	if ws, err := execute(conf, deferredSub, "/app", append([]string{"fsTreeVerify"}, treeArgs...)...); err != nil || ws != 0 {
+		t.Errorf("error verifying deferred restored rootfs, ws: %v, err: %v", ws, err)
+	}
+
+	// Filesystem snapshots cannot first be supplied after sandbox creation.
+	lateID := testutil.RandomContainerID()
+	startNoRootContainerSandbox(t, conf, lateID)
+	lateSub := newSub(lateID)
+	if err := lateSub.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err == nil || !strings.Contains(err.Error(), "without filesystem restore support") {
+		t.Errorf("Restore() = %v, want missing filesystem restore support error", err)
+	}
 
 	// The new root holds only /app, so the tree comes from the filesystem
 	// checkpoint in the image directory.

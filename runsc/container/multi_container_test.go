@@ -111,7 +111,15 @@ func startContainersWithArgs(conf *config.Config, specs []*specs.Spec, ids []str
 // TestMultiContainerNoRootContainer checks that a sandbox with no root
 // container outlives its containers, including the first and the last.
 func TestMultiContainerNoRootContainer(t *testing.T) {
-	conf := testutil.TestConfig(t)
+	for platform, conf := range configs(t, true /* noOverlay */) {
+		t.Run(platform, func(t *testing.T) {
+			testMultiContainerNoRootContainer(t, conf)
+		})
+	}
+}
+
+func testMultiContainerNoRootContainer(t *testing.T, conf *config.Config) {
+	t.Helper()
 	setupTestRootDir(t, conf)
 
 	sbID := testutil.RandomContainerID()
@@ -343,12 +351,27 @@ func TestNoRootContainerSignal(t *testing.T) {
 // TestNoRootContainerSIGTERM checks that SIGTERM to the sandbox process stops
 // the sandbox and releases waiters.
 func TestNoRootContainerSIGTERM(t *testing.T) {
-	conf := testutil.TestConfig(t)
+	for platform, conf := range configs(t, true /* noOverlay */) {
+		t.Run(platform, func(t *testing.T) {
+			for _, empty := range []bool{false, true} {
+				t.Run(fmt.Sprintf("empty=%t", empty), func(t *testing.T) {
+					testConf := *conf
+					testNoRootContainerSIGTERM(t, &testConf, empty)
+				})
+			}
+		})
+	}
+}
+
+func testNoRootContainerSIGTERM(t *testing.T, conf *config.Config, empty bool) {
+	t.Helper()
 	setupTestRootDir(t, conf)
 
 	sbID := testutil.RandomContainerID()
 	sb := startNoRootContainerSandbox(t, conf, sbID)
-	startNoRootContainerSub(t, conf, sbID, nil)
+	if !empty {
+		startNoRootContainerSub(t, conf, sbID, nil)
+	}
 
 	if err := unix.Kill(sb.Sandbox.Pid.Load(), unix.SIGTERM); err != nil {
 		t.Fatalf("error sending SIGTERM to sandbox: %v", err)
@@ -617,7 +640,15 @@ func TestNoRootContainerPIDNS(t *testing.T) {
 // it, but the namespace it names is the root one, so the container lands there
 // rather than in a new namespace.
 func TestNoRootContainerPIDNSSandboxSpec(t *testing.T) {
-	conf := testutil.TestConfig(t)
+	for platform, conf := range configs(t, true /* noOverlay */) {
+		t.Run(platform, func(t *testing.T) {
+			testNoRootContainerPIDNSSandboxSpec(t, conf)
+		})
+	}
+}
+
+func testNoRootContainerPIDNSSandboxSpec(t *testing.T, conf *config.Config) {
+	t.Helper()
 	setupTestRootDir(t, conf)
 
 	// Any path but /proc/<sandbox pid>/ns/pid, which Sandbox.fixPidns strips

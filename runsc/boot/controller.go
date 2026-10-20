@@ -130,8 +130,17 @@ func (c *controller) stop() {
 
 // containerManager manages sandbox containers.
 type containerManager struct {
+	// checkpointInitOnce binds this sentry to one checkpoint. Initialization
+	// failures are terminal, so checkpointInitErr is cached without retrying.
+	// Neither Do nor a call that waits for it may hold l.mu.
+	checkpointInitOnce sync.Once
+	checkpointInitErr  error
+
 	// restoreInitializing prevents subcontainers from using a partially
-	// initialized checkpoint. Waiters use l.restoreDone with l.mu released.
+	// initialized checkpoint. RestoreSubcontainer (including calls translated
+	// from StartSubcontainer) does not load a checkpoint and cannot wait on
+	// checkpointInitOnce without risking consuming it. These waiters use
+	// l.restoreDone with l.mu released.
 	//
 	// +checklocks:l.mu
 	restoreInitializing bool
@@ -363,8 +372,6 @@ func (cm *containerManager) PortForward(opts *sentryapi.PortForwardOpts, _ *stru
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
 func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retErr error) {
-	timer := starttime.Timer("Restore")
-	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
 
 	cm.l.mu.Lock()
@@ -381,7 +388,8 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		// Another subcontainer has already initialized the checkpoint. All
 		// subcontainers must use the same immutable checkpoint. The URPC server
 		// closes this call's unused file payload after the handler returns.
-		return nil
+		cu.Clean()
+		return cm.loadCheckpoint(o, true)
 	}
 	startedNoRoot := o.FromSubcontainer && cm.l.state == started && cm.l.noRootContainer.enabled && !cm.l.noRootKernelStarted
 	if cm.l.state != created && !startedNoRoot {
@@ -411,6 +419,32 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 			cm.onRestoreFailed(fmt.Errorf("Restore failed: %w", retErr))
 		}
 	}()
+
+	cu.Clean()
+	return cm.loadCheckpoint(o, startedNoRoot)
+}
+
+// loadCheckpoint is shared by root restore and the first business-container
+// restore in an already started no-root sandbox. Later calls reuse the result;
+// their unused file payloads remain owned by the URPC server. Container-specific
+// registration still happens separately in RestoreSubcontainer.
+//
+// Preconditions: the caller has admitted restore and does not hold l.mu.
+func (cm *containerManager) loadCheckpoint(o *sentryapi.RestoreOpts, startedNoRoot bool) error {
+	cm.checkpointInitOnce.Do(func() {
+		cm.checkpointInitErr = cm.initializeCheckpoint(o, startedNoRoot)
+	})
+	return cm.checkpointInitErr
+}
+
+// initializeCheckpoint prepares the shared restore resources and registers the
+// root container. Registering the root may complete a single-container restore.
+func (cm *containerManager) initializeCheckpoint(o *sentryapi.RestoreOpts, startedNoRoot bool) error {
+	timer := starttime.Timer("Restore")
+	timer.Reached("checkpoint initialization")
+	cm.l.mu.Lock()
+	cu := cleanup.Make(cm.l.mu.Unlock)
+	defer cu.Clean()
 
 	// If filesystem restore files were donated to the loader during sandbox
 	// creation, we must perform a split filesystem restore. Restoring a split

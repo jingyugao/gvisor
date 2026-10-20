@@ -3,11 +3,13 @@ name: Fork restore CI
 "on":
   pull_request:
     branches:
+      - "dev"
       - "fork/**"
       - "fix/restore-demand-wakeup"
       - "feat/restore-demand-only-v2"
   push:
     branches:
+      - "dev"
       - "fork/**"
   workflow_dispatch:
 
@@ -22,7 +24,7 @@ jobs:
   restore-validation:
     if: >-
       github.repository == 'jingyugao/gvisor' &&
-      (github.event_name != 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/fork/'))
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/fork/'))
     runs-on: ubuntu-latest
     steps:
     - name: Checkout

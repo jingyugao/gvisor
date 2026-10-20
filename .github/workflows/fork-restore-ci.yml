@@ -86,7 +86,28 @@ jobs:
         if grep -q 'awaitingCheckpoint' runsc/boot/loader.go; then
           # The runtime tests need capabilities. Recreate the privileged builder
           # as root instead of nesting a user namespace inside the runner.
-          sudo -E make bazel-shutdown
+          # bazel-shutdown can race Docker's --rm cleanup, so verify and remove
+          # only the builder whose name tools/bazel.mk derives from this checkout.
+          if ! sudo -E make bazel-shutdown; then
+            echo "bazel-shutdown did not complete cleanly; verifying builder removal"
+          fi
+          builder_hash="$(tools/compat/realpath.py "$PWD" | md5sum | cut -c1-8)"
+          docker_name="gvisor-bazel-${builder_hash}-$(uname -m)"
+          sudo docker info >/dev/null
+          sudo docker rm -f "$docker_name" >/dev/null 2>&1 || true
+          for attempt in {1..10}; do
+            remaining="$(sudo docker container ls -aq --filter "name=^/${docker_name}$")"
+            if [[ -z "$remaining" ]]; then
+              break
+            fi
+            sleep 1
+            sudo docker rm -f "$docker_name" >/dev/null 2>&1 || true
+          done
+          remaining="$(sudo docker container ls -aq --filter "name=^/${docker_name}$")"
+          if [[ -n "$remaining" ]]; then
+            echo "builder container $docker_name still exists after cleanup attempts" >&2
+            exit 1
+          fi
           sudo -E env BAZEL_CACHE="${HOME}/.cache/bazel/" make test TARGETS=//runsc/container:container_test OPTIONS='--jobs=2 --local_resources=memory=4096 --test_filter="^TestCheckpointRestoreNoRootContainer(|FailedRestore|SplitFS)$$" --test_arg=--test_platforms=systrap --test_sharding_strategy=disabled'
         fi
 

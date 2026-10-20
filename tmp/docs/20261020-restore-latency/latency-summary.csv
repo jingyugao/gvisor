@@ -1,0 +1,8 @@
+mode,configuration,shortLabel,n,operationMeanMs,healthMeanMs,stateMeanMs,healthMedianMs,healthMinMs,healthMaxMs,healthRangeMs,advancePrefetchMeanMs,prefetchPlusHealthMeanMs,prefetchPlusStateMeanMs
+cold-root-eager,无预创建池 / root / eager,无池 · root · eager,10,1166.6098309,1183.0464383,1456.1520599,1163.5971655,1116.501234,1366.222891,1116.50–1366.22,,,
+warm-root-eager,预创建池 / root / eager,池 · root · eager,10,679.0989881,694.9757644,974.3891027,686.5730585,641.156384,751.954702,641.16–751.95,,,
+warm-root-lazy,预创建池 / root / lazy,池 · root · lazy,10,235.5464267,528.8640075,998.2162747,708.3961285,189.443513,781.845608,189.44–781.85,,,
+warm-noroot-eager,预创建池 / no-root / eager,池 · no-root · eager,10,674.1915719,732.6664332,1015.3018248,736.570144,623.294478,833.826149,623.29–833.83,,,
+warm-noroot-lazy,预创建池 / no-root / lazy（默认组合）,池 · no-root · lazy,10,197.8320299,216.161173,999.9576261,217.4551495,198.069369,229.291235,198.07–229.29,,,
+warm-noroot-lazy-prefetch,默认组合 + 并行整文件预读,＋并行整文件预读,10,240.315619,255.7357517,831.1657502,254.8790485,221.561113,279.782804,221.56–279.78,,,
+warm-noroot-lazy-cache-hot,默认组合 + 提前全量预热,＋提前全量预热,10,189.6039933,203.310147,536.1655662,204.963581,190.691535,213.381962,190.69–213.38,421.58843131619506,624.8985783161951,957.753997516195

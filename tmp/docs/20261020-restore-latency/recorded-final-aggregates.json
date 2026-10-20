@@ -1,0 +1,152 @@
+{
+  "cold-root-eager": {
+    "n": 10,
+    "triggerToOperationMs": {
+      "meanMs": 1166.6098309,
+      "medianMs": 1147.174669,
+      "minMs": 1096.549689,
+      "maxMs": 1351.345559
+    },
+    "triggerToHealthMs": {
+      "meanMs": 1183.0464383,
+      "medianMs": 1163.5971655,
+      "minMs": 1116.501234,
+      "maxMs": 1366.222891
+    },
+    "triggerToStateMs": {
+      "meanMs": 1456.1520599,
+      "medianMs": 1441.6804539999998,
+      "minMs": 1386.409321,
+      "maxMs": 1641.581761
+    }
+  },
+  "warm-root-eager": {
+    "n": 10,
+    "triggerToOperationMs": {
+      "meanMs": 679.0989881,
+      "medianMs": 674.1544775,
+      "minMs": 625.384785,
+      "maxMs": 720.611342
+    },
+    "triggerToHealthMs": {
+      "meanMs": 694.9757644,
+      "medianMs": 686.5730585,
+      "minMs": 641.156384,
+      "maxMs": 751.954702
+    },
+    "triggerToStateMs": {
+      "meanMs": 974.3891027,
+      "medianMs": 967.9596335,
+      "minMs": 914.169075,
+      "maxMs": 1045.604939
+    }
+  },
+  "warm-root-lazy": {
+    "n": 10,
+    "triggerToOperationMs": {
+      "meanMs": 235.5464267,
+      "medianMs": 221.180137,
+      "minMs": 181.928586,
+      "maxMs": 376.719063
+    },
+    "triggerToHealthMs": {
+      "meanMs": 528.8640075,
+      "medianMs": 708.3961285,
+      "minMs": 189.443513,
+      "maxMs": 781.845608
+    },
+    "triggerToStateMs": {
+      "meanMs": 998.2162747,
+      "medianMs": 989.711806,
+      "minMs": 962.235807,
+      "maxMs": 1076.018071
+    }
+  },
+  "warm-noroot-eager": {
+    "n": 10,
+    "triggerToOperationMs": {
+      "meanMs": 674.1915719,
+      "medianMs": 652.354199,
+      "minMs": 561.170736,
+      "maxMs": 800.547434
+    },
+    "triggerToHealthMs": {
+      "meanMs": 732.6664332,
+      "medianMs": 736.570144,
+      "minMs": 623.294478,
+      "maxMs": 833.826149
+    },
+    "triggerToStateMs": {
+      "meanMs": 1015.3018248,
+      "medianMs": 1008.4296879999999,
+      "minMs": 958.226512,
+      "maxMs": 1100.555718
+    }
+  },
+  "warm-noroot-lazy": {
+    "n": 10,
+    "triggerToOperationMs": {
+      "meanMs": 197.8320299,
+      "medianMs": 202.0612805,
+      "minMs": 180.766094,
+      "maxMs": 209.786948
+    },
+    "triggerToHealthMs": {
+      "meanMs": 216.161173,
+      "medianMs": 217.4551495,
+      "minMs": 198.069369,
+      "maxMs": 229.291235
+    },
+    "triggerToStateMs": {
+      "meanMs": 999.9576261,
+      "medianMs": 1004.6422785,
+      "minMs": 933.054338,
+      "maxMs": 1070.365673
+    }
+  },
+  "warm-noroot-lazy-prefetch": {
+    "n": 10,
+    "triggerToOperationMs": {
+      "meanMs": 240.315619,
+      "medianMs": 239.4212655,
+      "minMs": 210.275959,
+      "maxMs": 271.165549
+    },
+    "triggerToHealthMs": {
+      "meanMs": 255.7357517,
+      "medianMs": 254.8790485,
+      "minMs": 221.561113,
+      "maxMs": 279.782804
+    },
+    "triggerToStateMs": {
+      "meanMs": 831.1657502,
+      "medianMs": 827.4315755,
+      "minMs": 754.510639,
+      "maxMs": 924.695162
+    }
+  },
+  "warm-noroot-lazy-cache-hot": {
+    "n": 10,
+    "triggerToOperationMs": {
+      "meanMs": 189.6039933,
+      "medianMs": 185.1091775,
+      "minMs": 178.342803,
+      "maxMs": 203.028937
+    },
+    "triggerToHealthMs": {
+      "meanMs": 203.310147,
+      "medianMs": 204.963581,
+      "minMs": 190.691535,
+      "maxMs": 213.381962
+    },
+    "triggerToStateMs": {
+      "meanMs": 536.1655662,
+      "medianMs": 536.753602,
+      "minMs": 508.24553,
+      "maxMs": 553.829225
+    },
+    "advancePrefetchMeanMs": 421.58843131619506,
+    "prefetchPlusHealthMeanMs": 624.8985783161951,
+    "prefetchPlusStateMeanMs": 957.753997516195
+  }
+}

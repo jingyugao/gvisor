@@ -1,0 +1,80 @@
+{
+  "reportDate": "2026-10-20",
+  "units": "milliseconds",
+  "final70": {
+    "measurementDate": "2026-10-20",
+    "evidenceClass": "preserved-execution-aggregates",
+    "groups": 7,
+    "reportedSamplesPerGroup": 10,
+    "individualSamplesAvailableThisReview": false,
+    "groupStatisticsRecomputedFromIndividualSamples": false,
+    "differencesRecomputedFromPreservedStatistics": true,
+    "originalMetricArtifact": "final-metrics.json",
+    "originalSampleArtifact": "live-final-1792464497135958223/benchmark.json",
+    "inputs": [
+      "recorded-final-aggregates.json",
+      "recorded-final-paired.json"
+    ],
+    "runtimeSourceCommit": "4320a3de3afb26889f0a0d28787107e9f299c0f4",
+    "cellboxSourceCommit": "c428c94eb1660284a5359f7d4730c0d0220cdb78",
+    "limits": [
+      "root/no-root use separate Boxes and rolling checkpoints; matched rounds are not same-checkpoint pairs",
+      "warm pool preparation and policy switching excluded from resume timer",
+      "advance cache warming paid before timer; cost reported separately",
+      "Linux checkpoint page cache cold; VM backing storage cache uncontrolled",
+      "loader wakeup fix present in every arm; no separate latency attribution"
+    ]
+  },
+  "cocell40": {
+    "measurementDate": "2026-10-16",
+    "evidenceClass": "recomputed-original-observations",
+    "evaluationSamples": 40,
+    "trainingRestores": 3,
+    "input": "cocell-samples.csv",
+    "originalSampleFile": "samples.json",
+    "originalSamplesSha256": "af207330876c25f9f090a5a4189a42ace07ae857108890098e56a5e04317ecdc",
+    "originalSummarySha256": "83f8bc146ac2ba6d23b5fc42ea4fb10560f06139b128805415edd85060f58599",
+    "build": {
+      "master_commit": "0e89e080d86336659595020d36ab938fe69acb00",
+      "master_version": "runsc version release-20261005.0-353-g0e89e080d863\nspec: 1.2.1",
+      "binary_sha256": {
+        "bin/master/runsc": "f12e76f7eb734eaa0ae71e1fa87fcf409f5d238efa4c2b4897a29b040a79a95d",
+        "bin/master/gvisor-bin/gvisor_sentry": "34af2012707de125b81e807dd9081f3fe53cf039e2d29991010d8c47abea88e8",
+        "bin/lazy/runsc": "e2d1cfb02d0d10492797d9ea63c48751c842f944bed9e79ed3634cad577acd51",
+        "bin/lazy/gvisor-bin/gvisor_sentry": "d92ffd5896239ef31be5a0a404a465f868b4a6af78760606c2c4c59bcca2a2a4",
+        "bin/master/gvisor-bin/gvisor-sentry-prewarmer": "ad1613f7d7abe84b8abc4e14bce3c230c04841d60114cf0e7decd42b3cf1ba18",
+        "bin/master/gvisor-bin/gvisor-proc-umounter": "f8bcc91a9ea695c817cab5e401f93d02b791717385c95ac5d4d9b4d2ff42f7ab",
+        "bin/lazy/gvisor-bin/gvisor-sentry-prewarmer": "ad1613f7d7abe84b8abc4e14bce3c230c04841d60114cf0e7decd42b3cf1ba18",
+        "bin/lazy/gvisor-bin/gvisor-proc-umounter": "f8bcc91a9ea695c817cab5e401f93d02b791717385c95ac5d4d9b4d2ff42f7ab"
+      },
+      "patched_commit": "f00784c266cde99ba816293776449c000945cd90",
+      "patched_version": "runsc version release-20261005.0-353-g0e89e080d863\nspec: 1.2.1",
+      "version_override_reason": "Same stock-master checkpoint reused across arms; patched build deliberately stamps stock-master version for compatibility. Real source commits and binary hashes are recorded separately.",
+      "build_memory_max_bytes": 4294967296,
+      "build_jobs": 2,
+      "c_sidecars_source": "Identical upstream source in both arms: runsc/prewarmer and runsc/procumounter"
+    },
+    "metric": "restore trigger to first real POST /v1/responses received by forwarding proxy",
+    "sameCheckpointAcrossArms": true,
+    "excluded": [
+      "Pod scheduling",
+      "image pull",
+      "client startup",
+      "full CoCell control plane",
+      "downstream inference"
+    ],
+    "limits": [
+      "no no-root comparison",
+      "hotset specific to one checkpoint",
+      "three training restores are not zero-cost",
+      "patched binary used stock version stamp to reuse checkpoint"
+    ],
+    "exportTransformation": "Select round, strategy, first_provider_request_ms, turn_completed_ms from the original samples; preserve all 40 evaluation rows; CSV line endings normalized to LF."
+  },
+  "sourcePolicy": "Only timings, preserved aggregates, source identifiers and evidence hashes are published. No credentials, memory images, model text, machine paths or session logs are included.",
+  "inputSha256": {
+    "recorded-final-aggregates.json": "97161503e83556fca99cf7eb3e29e5ef63243c1a106bef3f244b5e343d3592b1",
+    "recorded-final-paired.json": "eb6192349e0a90fbaeaa08f60dbf012b093aa9af838e5b71de40e7571e48109a",
+    "cocell-samples.csv": "036d54f3a019d14b14f818ae904beeef294826abf6e5dbbecca7612eae9c0a6b"
+  }
+}

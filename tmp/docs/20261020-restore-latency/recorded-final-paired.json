@@ -1,0 +1,106 @@
+[
+  {
+    "step": "warm-root-eager vs cold-root-eager",
+    "metrics": {
+      "triggerToOperationMs": {
+        "meanSavedMs": 487.51084280000003,
+        "medianSavedMs": 469.93287399999997,
+        "wins": 10,
+        "minSavedMs": 425.42686700000013,
+        "maxSavedMs": 666.059506
+      },
+      "triggerToHealthMs": {
+        "meanSavedMs": 488.07067390000003,
+        "medianSavedMs": 472.0428105,
+        "wins": 10,
+        "minSavedMs": 426.98147800000004,
+        "maxSavedMs": 673.9422539999999
+      },
+      "triggerToStateMs": {
+        "meanSavedMs": 481.76295719999996,
+        "medianSavedMs": 455.0968065,
+        "wins": 10,
+        "minSavedMs": 403.54927,
+        "maxSavedMs": 675.1298469999999
+      }
+    }
+  },
+  {
+    "step": "warm-root-lazy vs warm-root-eager",
+    "metrics": {
+      "triggerToOperationMs": {
+        "meanSavedMs": 443.5525614,
+        "medianSavedMs": 451.29209,
+        "wins": 10,
+        "minSavedMs": 261.643336,
+        "maxSavedMs": 511.616302
+      },
+      "triggerToHealthMs": {
+        "meanSavedMs": 166.1117569,
+        "medianSavedMs": 13.56041149999993,
+        "wins": 5,
+        "minSavedMs": -105.66426000000001,
+        "maxSavedMs": 512.690379
+      },
+      "triggerToStateMs": {
+        "meanSavedMs": -23.827171999999962,
+        "medianSavedMs": -12.300356999999963,
+        "wins": 2,
+        "minSavedMs": -105.68913399999997,
+        "maxSavedMs": 42.21842800000002
+      }
+    }
+  },
+  {
+    "step": "warm-noroot-lazy vs warm-root-lazy",
+    "metrics": {
+      "triggerToOperationMs": {
+        "meanSavedMs": 37.7143968,
+        "medianSavedMs": 19.852113000000003,
+        "wins": 8,
+        "minSavedMs": -27.858362,
+        "maxSavedMs": 172.33445500000002
+      },
+      "triggerToHealthMs": {
+        "meanSavedMs": 312.7028345,
+        "medianSavedMs": 486.464666,
+        "wins": 9,
+        "minSavedMs": -39.341499,
+        "maxSavedMs": 557.1809979999999
+      },
+      "triggerToStateMs": {
+        "meanSavedMs": -1.7413513999999963,
+        "medianSavedMs": -7.172717999999975,
+        "wins": 5,
+        "minSavedMs": -80.17502499999989,
+        "maxSavedMs": 89.25406999999996
+      }
+    }
+  },
+  {
+    "step": "warm-noroot-lazy-prefetch vs warm-noroot-lazy",
+    "metrics": {
+      "triggerToOperationMs": {
+        "meanSavedMs": -42.483589099999996,
+        "medianSavedMs": -45.1574145,
+        "wins": 0,
+        "minSavedMs": -74.174465,
+        "maxSavedMs": -4.975778999999989
+      },
+      "triggerToHealthMs": {
+        "meanSavedMs": -39.5745787,
+        "medianSavedMs": -47.261508500000005,
+        "wins": 1,
+        "minSavedMs": -66.71586099999999,
+        "maxSavedMs": 3.506321999999983
+      },
+      "triggerToStateMs": {
+        "meanSavedMs": 168.79187589999998,
+        "medianSavedMs": 135.79883299999995,
+        "wins": 10,
+        "minSavedMs": 96.89190600000006,
+        "maxSavedMs": 293.44153399999993
+      }
+    }
+  }
+]

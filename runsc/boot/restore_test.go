@@ -15,9 +15,121 @@
 package boot
 
 import (
+	"errors"
 	"math"
+	"os"
 	"testing"
+	"time"
+
+	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
+
+// notifyingLocker signals when Cond.Wait releases the lock. This lets tests
+// synchronize with the waiter without sleeps or scheduler assumptions.
+type notifyingLocker struct {
+	mu      sync.Locker
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (l *notifyingLocker) Lock() {
+	l.mu.Lock()
+}
+
+func (l *notifyingLocker) Unlock() {
+	l.mu.Unlock()
+	l.once.Do(func() { close(l.waiting) })
+}
+
+func waitForRestoreWaiter(t *testing.T, locker *notifyingLocker) {
+	t.Helper()
+	select {
+	case <-locker.waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("restore request did not wait for checkpoint initialization")
+	}
+}
+
+func newRestoreWaitTestManager() (*containerManager, *notifyingLocker) {
+	l := &Loader{state: restoringUnstarted}
+	locker := &notifyingLocker{mu: &l.mu, waiting: make(chan struct{})}
+	l.restoreDone = sync.NewCond(locker)
+	return &containerManager{l: l, restoreInitializing: true}, locker
+}
+
+func broadcastRestoreState(cm *containerManager, state loaderState, err error) {
+	cm.l.mu.Lock()
+	cm.restoreInitializing = false
+	cm.l.state = state
+	cm.l.restoreErr = err
+	cm.l.restoreDone.Broadcast()
+	cm.l.mu.Unlock()
+}
+
+func TestRestoreWaitsForCheckpointInitialization(t *testing.T) {
+	cm, locker := newRestoreWaitTestManager()
+	cm.l.noRootContainer.enabled = true
+	result := make(chan error, 1)
+	go func() {
+		result <- cm.Restore(&sentryapi.RestoreOpts{
+			FromSubcontainer: true,
+			FilePayload:      urpc.FilePayload{Files: []*os.File{os.Stdin}},
+		}, nil)
+	}()
+	waitForRestoreWaiter(t, locker)
+
+	// The second business container reuses the checkpoint initialized by the
+	// first one, so its checkpoint payload is intentionally not read.
+	broadcastRestoreState(cm, restoringUnstarted, nil)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Restore() = %v, want nil after initialization completes", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Restore() remained blocked after initialization completed")
+	}
+}
+
+func TestRestoreWaitReturnsInitializationFailure(t *testing.T) {
+	wantErr := errors.New("checkpoint initialization failed")
+	for _, tc := range []struct {
+		name string
+		call func(*containerManager) error
+	}{
+		{
+			name: "Restore",
+			call: func(cm *containerManager) error {
+				return cm.Restore(&sentryapi.RestoreOpts{}, nil)
+			},
+		},
+		{
+			name: "RestoreSubcontainer",
+			call: func(cm *containerManager) error {
+				return cm.RestoreSubcontainer(&sentryapi.StartArgs{}, nil)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm, locker := newRestoreWaitTestManager()
+			result := make(chan error, 1)
+			go func() { result <- tc.call(cm) }()
+			waitForRestoreWaiter(t, locker)
+
+			broadcastRestoreState(cm, restoreFailed, wantErr)
+			select {
+			case err := <-result:
+				if err != wantErr {
+					t.Fatalf("handler error = %v, want original initialization error %v", err, wantErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("handler remained blocked after initialization failed")
+			}
+		})
+	}
+}
 
 func TestTSCOffsetFromSnapshot(t *testing.T) {
 	const (

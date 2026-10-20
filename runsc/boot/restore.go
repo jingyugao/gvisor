@@ -240,6 +240,9 @@ type restorer struct {
 	// restorer.restore() returns.
 	background bool
 
+	// started indicates the no-root sandbox already acknowledged normal start.
+	started bool
+
 	// mainMF is the main MemoryFile of the sandbox.
 	// It is created as soon as possible, and may be restored to as soon as
 	// the first container is restored, which is earlier than when the sandbox's
@@ -646,7 +649,12 @@ func (r *restorer) restore(l *Loader) error {
 	cu.Clean()
 
 	r.timer.Reached("Starting sandbox")
-	if err := r.cm.onStart(); err != nil {
+	if r.started {
+		// The boot goroutine already consumed the sandbox's start signal.
+		if err := l.run(); err != nil {
+			return fmt.Errorf("starting restored no-root kernel: %w", err)
+		}
+	} else if err := r.cm.onStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
 	}
 

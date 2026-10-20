@@ -494,7 +494,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 		return err
 	}
 	// Configure the network.
-	if err := setupNetwork(conn, pid, conf, disableIPv6, false); err != nil {
+	if err := setupNetwork(conn, pid, conf, disableIPv6, s.NoRootContainer); err != nil {
 		return fmt.Errorf("setting up network: %w", err)
 	}
 
@@ -568,14 +568,19 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
+	fromSubcontainer := !specutils.IsRootContainer(spec)
+	if imagePath == "" {
+		return fmt.Errorf("image-path is required for restore")
+	}
 
 	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
 		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
 	}
 
 	opt := sentryapi.RestoreOpts{
-		Background:     background,
-		SplitFSRestore: s.FSRestore,
+		Background:       background,
+		SplitFSRestore:   s.FSRestore,
+		FromSubcontainer: fromSubcontainer,
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {
@@ -585,8 +590,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
 		return err
 	}
-
-	// If the platform needs a device FD we must pass it in.
+	// The platform device is needed only when the checkpoint is restored.
 	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
 		return err
 	} else if deviceFile != nil {
@@ -601,23 +605,26 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 	defer conn.Close()
 
-	if networkArgs == nil {
-		var disableIPv6 bool
-		disableIPv6, err = getDisableIPv6(spec)
-		if err != nil {
-			return err
-		}
-		// Scrape the host network to get the network config and store it in the
-		// loader. The kernel will restore loaded network stack with this config.
-		if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
-			return fmt.Errorf("setting up network: %w", err)
-		}
-	} else {
-		// When network args is not nil, set it in the loader which will be used
-		// during restore to configure the loaded stack.
-		log.Debugf("Setting up network args, config: %+v", networkArgs)
-		if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
-			return fmt.Errorf("setting network args: %w", err)
+	// Subcontainers reuse the network configuration captured at sandbox start.
+	if !fromSubcontainer {
+		if networkArgs == nil {
+			var disableIPv6 bool
+			disableIPv6, err = getDisableIPv6(spec)
+			if err != nil {
+				return err
+			}
+			// Scrape the host network to get the network config and store it in the
+			// loader. The kernel will restore loaded network stack with this config.
+			if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
+				return fmt.Errorf("setting up network: %w", err)
+			}
+		} else {
+			// When network args is not nil, set it in the loader which will be used
+			// during restore to configure the loaded stack.
+			log.Debugf("Setting up network args, config: %+v", networkArgs)
+			if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
+				return fmt.Errorf("setting network args: %w", err)
+			}
 		}
 	}
 

@@ -61,12 +61,6 @@ jobs:
 
         make test OPTIONS="--jobs=2 --local_resources=memory=4096" TARGETS="${targets[*]}"
 
-    - name: Test deferred checkpoint restore when available
-      run: |
-        if grep -q 'awaitingCheckpoint' runsc/boot/loader.go; then
-          make test TARGETS=//runsc/container:container_test OPTIONS='--jobs=2 --local_resources=memory=4096 --test_filter="^TestCheckpointRestoreNoRootContainer(|FailedRestore|SplitFS)$$" --test_arg=--test_platforms=systrap --test_sharding_strategy=disabled'
-        fi
-
     - name: Build release layout
       run: |
         mkdir -p artifacts/release
@@ -86,6 +80,15 @@ jobs:
         test -s artifacts/SOURCE_COMMIT
         test -s artifacts/SHA256SUMS
         test -s artifacts/gvisor-release.tar.gz
+
+    - name: Test deferred checkpoint restore when available
+      run: |
+        if grep -q 'awaitingCheckpoint' runsc/boot/loader.go; then
+          # The runtime tests need capabilities. Recreate the privileged builder
+          # as root instead of nesting a user namespace inside the runner.
+          sudo -E make bazel-shutdown
+          sudo -E env BAZEL_CACHE="${HOME}/.cache/bazel/" make test TARGETS=//runsc/container:container_test OPTIONS='--jobs=2 --local_resources=memory=4096 --test_filter="^TestCheckpointRestoreNoRootContainer(|FailedRestore|SplitFS)$$" --test_arg=--test_platforms=systrap --test_sharding_strategy=disabled'
+        fi
 
     - name: Upload release layout
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

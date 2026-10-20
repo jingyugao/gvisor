@@ -121,6 +121,10 @@ type RestoreOpts struct {
 	HavePagesFile  bool
 	HaveDeviceFile bool
 	Background     bool
+	LazyPages      bool `json:"lazy_pages"`
+	// FromSubcontainer identifies a restore request issued while restoring a
+	// subcontainer in a no-root sandbox.
+	FromSubcontainer bool
 
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
@@ -165,6 +169,10 @@ const ContMgrWaitCheckpoint = "containerManager.WaitCheckpoint"
 
 // ContMgrWaitRestore waits for the Kernel restore to complete.
 const ContMgrWaitRestore = "containerManager.WaitRestore"
+
+// ContMgrWaitRestoreReady waits until post-restore hooks have succeeded and
+// application tasks can run. Unloaded pages still depend on the checkpoint.
+const ContMgrWaitRestoreReady = "containerManager.WaitRestoreReady"
 
 // ContMgrWaitFSCheckpoint waits for the next filesystem checkpoint save to
 // complete.

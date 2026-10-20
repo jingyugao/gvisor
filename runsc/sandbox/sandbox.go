@@ -563,36 +563,46 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 
 // Restore sends the restore call for a container in the sandbox.
 func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
+	if conf.RestorePageLoading == config.RestorePageLoadingLazy && !background {
+		return fmt.Errorf("--restore-page-loading=lazy requires runsc restore --background")
+	}
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
+	fromSubcontainer := !specutils.IsRootContainer(spec)
+	if imagePath == "" && (!s.NoRootContainer || fromSubcontainer || s.FSRestore) {
+		return fmt.Errorf("image-path is required except when preparing a no-root sandbox without split filesystem restore")
+	}
 
-	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
+	if imagePath != "" && !s.FSRestore && HasFSCheckpointManifest(imagePath) {
 		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
 	}
 
 	opt := sentryapi.RestoreOpts{
-		Background:     background,
-		SplitFSRestore: s.FSRestore,
+		Background:       background,
+		SplitFSRestore:   s.FSRestore,
+		FromSubcontainer: fromSubcontainer,
+		LazyPages:        conf.RestorePageLoading == config.RestorePageLoadingLazy,
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {
 			_ = f.Close()
 		}
 	}()
-	if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
-		return err
-	}
-
-	// If the platform needs a device FD we must pass it in.
-	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
-		return err
-	} else if deviceFile != nil {
-		defer deviceFile.Close()
-		opt.HaveDeviceFile = true
-		opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+	if imagePath != "" {
+		if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
+			return err
+		}
+		// The platform device is needed only when the checkpoint is restored.
+		if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
+			return err
+		} else if deviceFile != nil {
+			defer deviceFile.Close()
+			opt.HaveDeviceFile = true
+			opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+		}
 	}
 
 	conn, err := s.sandboxConnect()
@@ -601,23 +611,26 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 	defer conn.Close()
 
-	if networkArgs == nil {
-		var disableIPv6 bool
-		disableIPv6, err = getDisableIPv6(spec)
-		if err != nil {
-			return err
-		}
-		// Scrape the host network to get the network config and store it in the
-		// loader. The kernel will restore loaded network stack with this config.
-		if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
-			return fmt.Errorf("setting up network: %w", err)
-		}
-	} else {
-		// When network args is not nil, set it in the loader which will be used
-		// during restore to configure the loaded stack.
-		log.Debugf("Setting up network args, config: %+v", networkArgs)
-		if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
-			return fmt.Errorf("setting network args: %w", err)
+	// Subcontainers reuse the network configuration captured during preparation.
+	if !fromSubcontainer {
+		if networkArgs == nil {
+			var disableIPv6 bool
+			disableIPv6, err = getDisableIPv6(spec)
+			if err != nil {
+				return err
+			}
+			// Scrape the host network to get the network config and store it in the
+			// loader. The kernel will restore loaded network stack with this config.
+			if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
+				return fmt.Errorf("setting up network: %w", err)
+			}
+		} else {
+			// When network args is not nil, set it in the loader which will be used
+			// during restore to configure the loaded stack.
+			log.Debugf("Setting up network args, config: %+v", networkArgs)
+			if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
+				return fmt.Errorf("setting network args: %w", err)
+			}
 		}
 	}
 
@@ -630,7 +643,9 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		}
 		return fmt.Errorf("restoring container %q: %w", cid, err)
 	}
-	s.Restored = true
+	if imagePath != "" {
+		s.Restored = true
+	}
 	return nil
 }
 
@@ -1755,6 +1770,12 @@ func (s *Sandbox) WaitCheckpoint() error {
 func (s *Sandbox) WaitRestore() error {
 	log.Debugf("Waiting for restore to complete in sandbox %q", s.ID)
 	return s.call(sentryapi.ContMgrWaitRestore, nil, nil)
+}
+
+// WaitRestoreReady waits until application tasks can run after restore.
+// Checkpoint files must remain immutable while pages are still unloaded.
+func (s *Sandbox) WaitRestoreReady() error {
+	return s.call(sentryapi.ContMgrWaitRestoreReady, nil, nil)
 }
 
 // WaitFSCheckpoint waits for a filesystem checkpoint to have successfully been

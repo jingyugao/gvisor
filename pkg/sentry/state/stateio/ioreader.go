@@ -122,6 +122,11 @@ func (r *IOReader) Wait(cs []Completion, minCompletions int) ([]Completion, erro
 	return CompletionChanWait(r.cmps, cs, minCompletions)
 }
 
+// WaitInterruptible implements InterruptibleAsyncReader.WaitInterruptible.
+func (r *IOReader) WaitInterruptible(cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, bool, error) {
+	return CompletionChanWaitInterruptible(r.cmps, cs, minCompletions, wake)
+}
+
 func (r *IOReader) workerMain() {
 	defer r.workers.Done()
 	for {

@@ -177,6 +177,7 @@ go_test(
         "fscheckpoint_test.go",
         "loader_test.go",
         "mount_hints_test.go",
+        "restore_ready_test.go",
         "restore_test.go",
         "seccomp_test.go",
         "vfs_test.go",

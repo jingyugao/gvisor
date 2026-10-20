@@ -507,7 +507,20 @@ func (c *Container) Restore(conf *config.Config, imagePath string, direct, backg
 	restore := func(conf *config.Config, spec *specs.Spec) error {
 		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, direct, background, networkArgs)
 	}
-	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
+	restoreSub := func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error {
+		// In a no-root sandbox, the first restored subcontainer provides the
+		// checkpoint after the sandbox has been prepared.
+		if c.Sandbox.NoRootContainer {
+			if imagePath == "" {
+				return fmt.Errorf("image-path is required when restoring a subcontainer in a no-root sandbox")
+			}
+			if err := restore(conf, spec); err != nil {
+				return err
+			}
+		}
+		return c.Sandbox.RestoreSubcontainer(spec, conf, cid, stdios, goferFiles, goferFilestores, devIOFile, goferConfs)
+	}
+	return c.startImpl(conf, "restore", restore, restoreSub)
 }
 
 func (c *Container) startImpl(conf *config.Config, action string, startRoot func(conf *config.Config, spec *specs.Spec) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []specutils.GoferMountConf) error) error {
@@ -788,6 +801,15 @@ func (c *Container) WaitRestore() error {
 		return err
 	}
 	return c.Sandbox.WaitRestore()
+}
+
+// WaitRestoreReady waits until the restored application can run, without
+// waiting for every checkpoint page to be loaded.
+func (c *Container) WaitRestoreReady() error {
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
+	}
+	return c.Sandbox.WaitRestoreReady()
 }
 
 // WaitFSCheckpoint waits for a filesystem checkpoint to have successfully been

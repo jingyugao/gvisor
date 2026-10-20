@@ -171,6 +171,9 @@ const (
 	// started indicates that the Loader has been started. This means that the
 	// root container is running. Subsequent containers may still be unstarted.
 	started
+	// awaitingCheckpoint is a no-root sandbox prepared for restore, before a
+	// subcontainer supplies the checkpoint. The kernel has not been restored.
+	awaitingCheckpoint
 	// restoringUnstarted indicates that the Loader has been created and is
 	// restoring containers, but not started yet.
 	restoringUnstarted
@@ -190,6 +193,8 @@ func (s loaderState) String() string {
 		return "created"
 	case started:
 		return "started"
+	case awaitingCheckpoint:
+		return "awaitingCheckpoint"
 	case restoringUnstarted:
 		return "restoringUnstarted"
 	case restoringStarted:
@@ -235,6 +240,12 @@ type Loader struct {
 	// much after the sandbox has started because under some configurations, the
 	// restore is allowed to proceed in the background while the sandbox runs.
 	restoreDone *sync.Cond
+
+	// restoreReady is set after post-restore hooks finish and the application
+	// can run, even while checkpoint pages remain unloaded.
+	//
+	// +checklocks:mu
+	restoreReady bool
 
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
@@ -717,6 +728,9 @@ func New(args Args) (*Loader, error) {
 		fsrOpts, err := makeFSRestoreOpts(&args)
 		if err != nil {
 			return nil, fmt.Errorf("failed to set up filesystem checkpoint restore: %w", err)
+		}
+		for i := range fsrOpts {
+			fsrOpts[i].PageLoadOpts.DisableBackground = args.Conf.RestorePageLoading == config.RestorePageLoadingLazy
 		}
 		fsr, err := startFSRestore(fsrOpts)
 		if err != nil {
@@ -1964,7 +1978,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	l.mu.Lock()
 	state := l.state
-	if state == restoringUnstarted {
+	if state == awaitingCheckpoint || state == restoringUnstarted {
 		log.Infof("Waiting for the container to restore, CID: %q", cid)
 		l.restoreDone.Wait()
 		l.mu.Unlock()
@@ -2034,14 +2048,25 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 func (l *Loader) waitRestore() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.state == restored || l.state == restoreFailed {
-		return l.restoreErr
+	for l.state != restored && l.state != restoreFailed {
+		if l.state != awaitingCheckpoint && l.state != restoringUnstarted && l.state != restoringStarted {
+			return fmt.Errorf("sandbox is not being restored, cannot wait for restore: state=%s", l.state)
+		}
+		l.restoreDone.Wait()
 	}
-	if l.state != restoringUnstarted && l.state != restoringStarted {
-		return fmt.Errorf("sandbox is not being restored, cannot wait for restore: state=%s", l.state)
+	return l.restoreErr
+}
+
+// +checklocksexclude:l.mu
+func (l *Loader) waitRestoreReady() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for !l.restoreReady && l.state != restored && l.state != restoreFailed {
+		if l.state != awaitingCheckpoint && l.state != restoringUnstarted && l.state != restoringStarted {
+			return fmt.Errorf("sandbox is not being restored, cannot wait for restore readiness: state=%s", l.state)
+		}
+		l.restoreDone.Wait()
 	}
-	log.Infof("Waiting for the sandbox to restore")
-	l.restoreDone.Wait()
 	return l.restoreErr
 }
 

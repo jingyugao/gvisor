@@ -25,6 +25,23 @@ import (
 	"gvisor.dev/gvisor/pkg/rand"
 )
 
+func TestGoQueueInterruptedWaitPreservesCompletions(t *testing.T) {
+	q := NewGoQueue(2)
+	defer q.Destroy()
+	q.completions <- Completion{ID: 1, Result: 4096}
+	wake := make(chan struct{}, 1)
+	wake <- struct{}{}
+	cs, interrupted, err := q.WaitInterruptible([]Completion{{ID: 9}}, 2, wake)
+	if err != nil || !interrupted || len(cs) != 2 || cs[0].ID != 9 || cs[1].ID != 1 {
+		t.Fatalf("interruptible wait = (%v, %t, %v), want prefix and ready completion", cs, interrupted, err)
+	}
+	q.completions <- Completion{ID: 2, Result: 4096}
+	cs, err = q.Wait(nil, 1)
+	if err != nil || len(cs) != 1 || cs[0].ID != 2 {
+		t.Fatalf("subsequent wait = (%v, %v), want only completion 2", cs, err)
+	}
+}
+
 func testRead(t *testing.T, newQueue func(cap int) (Queue, error)) {
 	// Create a temp file.
 	testFile, err := os.CreateTemp(t.TempDir(), "aio_test_read")

@@ -240,6 +240,9 @@ type restorer struct {
 	// restorer.restore() returns.
 	background bool
 
+	// started indicates the no-root sandbox already acknowledged normal start.
+	started bool
+
 	// mainMF is the main MemoryFile of the sandbox.
 	// It is created as soon as possible, and may be restored to as soon as
 	// the first container is restored, which is earlier than when the sandbox's
@@ -317,6 +320,18 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// A request can wait here while another container finishes restoring or
+	// shutdown begins. Recheck before changing the container list or timer.
+	l.mu.Lock()
+	state, restoreErr := l.state, l.restoreErr
+	l.mu.Unlock()
+	if state == restoreFailed {
+		return restoreErr
+	}
+	if state != restoringUnstarted {
+		return fmt.Errorf("cannot register restored container in state=%s", state)
+	}
+
 	for _, container := range r.containers {
 		if container.containerName == info.containerName {
 			return fmt.Errorf("container %q already restored", info.containerName)
@@ -358,8 +373,16 @@ func (r *restoreMounts) String() string {
 	return fmt.Sprintf("fdmap: %#v, mfmap: %v, fsCheckpointedMfs: %v", r.fdmap, r.mfmap, r.fsCheckpointedMfs)
 }
 
-func (r *restorer) restore(l *Loader) error {
+func (r *restorer) restore(l *Loader) (retErr error) {
 	log.Infof("Starting to restore %d containers", len(r.containers))
+	l.kernelMu.Lock()
+	defer l.kernelMu.Unlock()
+	l.mu.Lock()
+	state := l.state
+	l.mu.Unlock()
+	if state != restoringUnstarted {
+		return fmt.Errorf("cannot restore kernel in state=%s", state)
+	}
 
 	// Validate the container specs to ensure they did not meaningfully change
 	// between checkpoint and restore.
@@ -392,11 +415,34 @@ func (r *restorer) restore(l *Loader) error {
 	// Start the old watchdog before replacing it with a new one below.
 	l.watchdog.Start()
 
-	// Release the kernel and replace it with a new one that will be restored into.
+	// Keep the initialized, empty kernel until the replacement can run. If
+	// loading fails, shutdown must not call Kill or Release on a partially
+	// decoded kernel. kernelMu excludes WaitExit and Destroy during this swap.
+	oldKernel := l.k
+	oldWatchdog := l.watchdog
+	defer func() {
+		if retErr == nil {
+			oldKernel.Release()
+			return
+		}
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.k = oldKernel
+		if l.watchdog != oldWatchdog {
+			l.watchdog.Start()
+			l.watchdog.Stop()
+			l.watchdog = oldWatchdog
+		}
+		// The failed replacement's tasks were never started. Do not let Wait
+		// RPCs wait on them; restore failure is reported through loader state.
+		for _, ep := range l.processes {
+			ep.tg = nil
+		}
+		l.ctrl.refreshHandlers()
+	}()
 	var oldNvidiaDriverVersion nvconf.DriverVersion
 	if l.k != nil {
 		oldNvidiaDriverVersion = l.k.NvidiaDriverVersion
-		l.k.Release()
 	}
 	l.k = &kernel.Kernel{
 		Platform: p,
@@ -646,7 +692,12 @@ func (r *restorer) restore(l *Loader) error {
 	cu.Clean()
 
 	r.timer.Reached("Starting sandbox")
-	if err := r.cm.onStart(); err != nil {
+	if r.started {
+		// The boot goroutine already consumed the sandbox's start signal.
+		if err := l.run(); err != nil {
+			return fmt.Errorf("starting restored no-root kernel: %w", err)
+		}
+	} else if err := r.cm.onStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
 	}
 

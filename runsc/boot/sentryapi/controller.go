@@ -121,6 +121,7 @@ type RestoreOpts struct {
 	HavePagesFile  bool
 	HaveDeviceFile bool
 	Background     bool
+	LazyPages      bool
 
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing

@@ -1314,6 +1314,10 @@ type AsyncPagesFileLoad struct {
 	// priority is protected by mu.
 	priority ringdeque.Deque[aplFileRange]
 
+	// priorityWake coalesces demand notifications for interruptible readers.
+	// Only the loader consumes tokens; demand producers never call the reader.
+	priorityWake chan struct{}
+
 	// lfStatus communicates MemoryFile.LoadFrom() state to the async page
 	// loader goroutine.
 	lfStatus syncevent.Waiter
@@ -1529,6 +1533,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		op.iovecs = make([]unix.Iovec, 0, maxRanges)
 	}
 	apfl.lfStatus.Init()
+	apfl.priorityWake = make(chan struct{}, 1)
 	go apfl.main()
 	return apfl, nil
 }
@@ -1611,6 +1616,10 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		}
 		apfl.numWaiters++
 		apfl.totalWaiters++
+		select {
+		case apfl.priorityWake <- struct{}{}:
+		default:
+		}
 	}
 	apfl.mu.Unlock()
 	if pending {
@@ -2000,7 +2009,14 @@ func (apfl *AsyncPagesFileLoad) main() {
 
 		// Wait for any number of reads to complete.
 		var err error
-		completions, err = apfl.ar.Wait(completions[:0], 1 /* minCompletions */)
+		if reader, ok := apfl.ar.(stateio.InterruptibleAsyncReader); ok && apfl.canEnqueue() {
+			// A new demand can use spare capacity without waiting for an
+			// unrelated read to finish. Buffered notifications also cover the
+			// interval between checking priority and starting this wait.
+			completions, _, err = reader.WaitInterruptible(completions[:0], 1, apfl.priorityWake)
+		} else {
+			completions, err = apfl.ar.Wait(completions[:0], 1 /* minCompletions */)
+		}
 		if err != nil {
 			log.Warningf("Async page loading failed: stateio.AsyncReader.Wait failed: %v", err)
 			apfl.mu.Lock()

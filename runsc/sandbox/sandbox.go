@@ -563,6 +563,9 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 
 // Restore sends the restore call for a container in the sandbox.
 func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
+	if conf.RestorePageLoading == config.RestorePageLoadingLazy && !background {
+		return fmt.Errorf("lazy checkpoint page loading requires background restore")
+	}
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
@@ -576,6 +579,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	opt := sentryapi.RestoreOpts{
 		Background:     background,
 		SplitFSRestore: s.FSRestore,
+		LazyPages:      conf.RestorePageLoading == config.RestorePageLoadingLazy,
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {

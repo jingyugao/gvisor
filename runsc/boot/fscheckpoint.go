@@ -273,6 +273,7 @@ type fsRestoreOpts struct {
 	MultiTarFile      io.ReadCloser
 	PagesMetadataFile io.ReadCloser
 	PagesFile         stateio.AsyncReader
+	PageLoadOpts      pgalloc.AsyncPagesFileLoadOpts
 }
 
 func makeFSRestoreOpts(args *Args) ([]fsRestoreOpts, error) {
@@ -495,7 +496,7 @@ func startFSRestore(optsList []fsRestoreOpts) (*fsRestore, error) {
 				} else if log.IsLogging(log.Debug) {
 					log.Debugf("Finished loading filesystem checkpoint pages")
 				}
-			}, nil)
+			}, nil, opts.PageLoadOpts)
 			opts.PagesFile = nil
 			if err != nil {
 				return fmt.Errorf("failed to start async page loading: %w", err)

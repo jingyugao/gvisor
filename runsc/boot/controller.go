@@ -43,6 +43,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
+	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
@@ -372,6 +373,8 @@ func (cm *containerManager) PortForward(opts *sentryapi.PortForwardOpts, _ *stru
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
 func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retErr error) {
+	timer := starttime.Timer("Restore")
+	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
 
 	cm.l.mu.Lock()
@@ -389,7 +392,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		// subcontainers must use the same immutable checkpoint. The URPC server
 		// closes this call's unused file payload after the handler returns.
 		cu.Clean()
-		return cm.loadCheckpoint(o, true)
+		return cm.loadCheckpoint(o, true, timer)
 	}
 	startedNoRoot := o.FromSubcontainer && cm.l.state == started && cm.l.noRootContainer.enabled && !cm.l.noRootKernelStarted
 	if cm.l.state != created && !startedNoRoot {
@@ -421,7 +424,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	}()
 
 	cu.Clean()
-	return cm.loadCheckpoint(o, startedNoRoot)
+	return cm.loadCheckpoint(o, startedNoRoot, timer)
 }
 
 // loadCheckpoint is shared by root restore and the first business-container
@@ -430,17 +433,16 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 // registration still happens separately in RestoreSubcontainer.
 //
 // Preconditions: the caller has admitted restore and does not hold l.mu.
-func (cm *containerManager) loadCheckpoint(o *sentryapi.RestoreOpts, startedNoRoot bool) error {
+func (cm *containerManager) loadCheckpoint(o *sentryapi.RestoreOpts, startedNoRoot bool, timer *timing.Timer) error {
 	cm.checkpointInitOnce.Do(func() {
-		cm.checkpointInitErr = cm.initializeCheckpoint(o, startedNoRoot)
+		cm.checkpointInitErr = cm.initializeCheckpoint(o, startedNoRoot, timer)
 	})
 	return cm.checkpointInitErr
 }
 
 // initializeCheckpoint prepares the shared restore resources and registers the
 // root container. Registering the root may complete a single-container restore.
-func (cm *containerManager) initializeCheckpoint(o *sentryapi.RestoreOpts, startedNoRoot bool) error {
-	timer := starttime.Timer("Restore")
+func (cm *containerManager) initializeCheckpoint(o *sentryapi.RestoreOpts, startedNoRoot bool, timer *timing.Timer) error {
 	timer.Reached("checkpoint initialization")
 	cm.l.mu.Lock()
 	cu := cleanup.Make(cm.l.mu.Unlock)

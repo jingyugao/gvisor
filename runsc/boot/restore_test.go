@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/starttime"
 )
 
 // notifyingLocker signals when Cond.Wait releases the lock. This lets tests
@@ -157,7 +158,7 @@ func TestLoadCheckpointCachesFailure(t *testing.T) {
 	for i := 0; i < callers; i++ {
 		go func() {
 			<-start
-			results <- cm.loadCheckpoint(&sentryapi.RestoreOpts{SplitFSRestore: true}, false)
+			results <- cm.loadCheckpoint(&sentryapi.RestoreOpts{SplitFSRestore: true}, false, starttime.Timer("Restore"))
 		}()
 	}
 	close(start)
@@ -178,7 +179,7 @@ func TestLoadCheckpointCachesFailure(t *testing.T) {
 		}
 	}
 	// These arguments would fail differently if initialization were retried.
-	if err := cm.loadCheckpoint(&sentryapi.RestoreOpts{}, true); err != first {
+	if err := cm.loadCheckpoint(&sentryapi.RestoreOpts{}, true, starttime.Timer("Restore")); err != first {
 		t.Fatalf("second loadCheckpoint() = %v, want cached error %v", err, first)
 	}
 }

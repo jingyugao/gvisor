@@ -184,18 +184,33 @@ func (q *GoQueue) Add(r Request) {
 
 // Wait implements Queue.Wait.
 func (q *GoQueue) Wait(cs []Completion, minCompletions int) ([]Completion, error) {
+	cs, _, err := q.WaitInterruptible(cs, minCompletions, nil)
+	return cs, err
+}
+
+// WaitInterruptible is like Wait, but receiving from wake permits returning
+// before minCompletions have completed. It returns all immediately available
+// completions, including when interrupted. No queue operation is canceled.
+// The caller must serialize this method with Add, Wait and Destroy.
+func (q *GoQueue) WaitInterruptible(cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, bool, error) {
 	i := 0
+	interrupted := false
 	for {
-		if i < minCompletions {
-			cs = append(cs, <-q.completions)
-			i++
+		if i < minCompletions && !interrupted {
+			select {
+			case c := <-q.completions:
+				cs = append(cs, c)
+				i++
+			case <-wake:
+				interrupted = true
+			}
 		} else {
 			select {
 			case c := <-q.completions:
 				cs = append(cs, c)
 				i++
 			default:
-				return cs, nil
+				return cs, interrupted, nil
 			}
 		}
 	}

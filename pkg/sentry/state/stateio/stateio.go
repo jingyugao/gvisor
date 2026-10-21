@@ -123,6 +123,19 @@ type AsyncReader interface {
 	Wait(cs []Completion, minCompletions int) ([]Completion, error)
 }
 
+// InterruptibleAsyncReader supports waking a completion wait to submit new
+// requests. Implementations must preserve all inflight reads and return any
+// completions already consumed, even when interrupted. Callers must serialize
+// WaitInterruptible with AddRead, AddReadv, Wait and Close, just like Wait.
+type InterruptibleAsyncReader interface {
+	AsyncReader
+
+	// WaitInterruptible is like Wait, but receiving from wake allows fewer
+	// than minCompletions to be returned. The bool reports an interruption.
+	// A nil wake channel gives the same behavior as Wait.
+	WaitInterruptible(cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, bool, error)
+}
+
 // AsyncWriter represents a file supporting asynchronous sequential writes.
 //
 // MaxWriteBytes, MaxRanges, MaxParallel, and NeedRegisterSourceFD may be

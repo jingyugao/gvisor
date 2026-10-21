@@ -118,9 +118,15 @@ func (r *FDReader) AddReadv(id int, off int64, total uint64, _ DestinationFile, 
 
 // Wait implements AsyncReader.Wait.
 func (r *FDReader) Wait(cs []Completion, minCompletions int) ([]Completion, error) {
+	cs, _, err := r.WaitInterruptible(cs, minCompletions, nil)
+	return cs, err
+}
+
+// WaitInterruptible implements InterruptibleAsyncReader.WaitInterruptible.
+func (r *FDReader) WaitInterruptible(cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, bool, error) {
 retry:
 	numCompletions := 0
-	aioCS, err := r.q.Wait(r.cs, minCompletions)
+	aioCS, interrupted, err := r.q.WaitInterruptible(r.cs[:0], minCompletions, wake)
 	for _, aioC := range aioCS {
 		id := int(aioC.ID)
 		inflight := &r.inflight[id]
@@ -165,9 +171,9 @@ retry:
 			}
 		}
 	}
-	if numCompletions < minCompletions {
+	if numCompletions < minCompletions && !interrupted && err == nil {
 		minCompletions -= numCompletions
 		goto retry
 	}
-	return cs, err
+	return cs, interrupted, err
 }

@@ -116,16 +116,30 @@ func (r *LocalClientRanges) DropFirst(n uint64) (r2 LocalClientRanges) {
 // CompletionChanWait implements AsyncReader.Wait by receiving from a channel
 // of completions.
 func CompletionChanWait(ch <-chan Completion, cs []Completion, minCompletions int) ([]Completion, error) {
-	for minCompletions > 0 {
-		cs = append(cs, <-ch)
-		minCompletions--
+	cs, _, err := CompletionChanWaitInterruptible(ch, cs, minCompletions, nil)
+	return cs, err
+}
+
+// CompletionChanWaitInterruptible is CompletionChanWait with a wake channel.
+// Receiving from wake permits returning fewer than minCompletions; any ready
+// completions are still drained and returned to the caller.
+func CompletionChanWaitInterruptible(ch <-chan Completion, cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, bool, error) {
+	interrupted := false
+	for minCompletions > 0 && !interrupted {
+		select {
+		case c := <-ch:
+			cs = append(cs, c)
+			minCompletions--
+		case <-wake:
+			interrupted = true
+		}
 	}
 	for {
 		select {
 		case c := <-ch:
 			cs = append(cs, c)
 		default:
-			return cs, nil
+			return cs, interrupted, nil
 		}
 	}
 }

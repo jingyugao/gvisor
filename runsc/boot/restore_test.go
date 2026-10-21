@@ -15,9 +15,208 @@
 package boot
 
 import (
+	"errors"
 	"math"
+	"os"
 	"testing"
+	"time"
+
+	"github.com/opencontainers/runtime-spec/specs-go"
+
+	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
+	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/starttime"
 )
+
+// notifyingLocker signals when Cond.Wait releases the lock. This lets tests
+// synchronize with the waiter without sleeps or scheduler assumptions.
+type notifyingLocker struct {
+	mu      sync.Locker
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (l *notifyingLocker) Lock() {
+	l.mu.Lock()
+}
+
+func (l *notifyingLocker) Unlock() {
+	l.mu.Unlock()
+	l.once.Do(func() { close(l.waiting) })
+}
+
+func waitForRestoreWaiter(t *testing.T, locker *notifyingLocker) {
+	t.Helper()
+	select {
+	case <-locker.waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("restore request did not wait for checkpoint initialization")
+	}
+}
+
+func newRestoreWaitTestManager() (*containerManager, *notifyingLocker) {
+	l := &Loader{state: restoringUnstarted}
+	locker := &notifyingLocker{mu: &l.mu, waiting: make(chan struct{})}
+	l.restoreDone = sync.NewCond(locker)
+	return &containerManager{l: l, restoreInitializing: true}, locker
+}
+
+func broadcastRestoreState(cm *containerManager, state loaderState, err error) {
+	// Model the completion of the once-protected initialization before waking
+	// RPC waiters, including its cached result.
+	cm.checkpointInitOnce.Do(func() { cm.checkpointInitErr = err })
+	cm.l.mu.Lock()
+	cm.restoreInitializing = false
+	cm.l.state = state
+	cm.l.restoreErr = err
+	cm.l.restoreDone.Broadcast()
+	cm.l.mu.Unlock()
+}
+
+func TestRestoreWaitsForCheckpointInitialization(t *testing.T) {
+	cm, locker := newRestoreWaitTestManager()
+	cm.l.noRootContainer.enabled = true
+	result := make(chan error, 1)
+	go func() {
+		result <- cm.Restore(&sentryapi.RestoreOpts{
+			FromSubcontainer: true,
+			FilePayload:      urpc.FilePayload{Files: []*os.File{os.Stdin}},
+		}, nil)
+	}()
+	waitForRestoreWaiter(t, locker)
+
+	// The second business container reuses the checkpoint initialized by the
+	// first one, so its checkpoint payload is intentionally not read.
+	broadcastRestoreState(cm, restoringUnstarted, nil)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Restore() = %v, want nil after initialization completes", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Restore() remained blocked after initialization completed")
+	}
+}
+
+func TestRestoreWaitReturnsInitializationFailure(t *testing.T) {
+	wantErr := errors.New("checkpoint initialization failed")
+	for _, tc := range []struct {
+		name string
+		call func(*containerManager) error
+	}{
+		{
+			name: "Restore",
+			call: func(cm *containerManager) error {
+				return cm.Restore(&sentryapi.RestoreOpts{}, nil)
+			},
+		},
+		{
+			name: "StartSubcontainer",
+			call: func(cm *containerManager) error {
+				return cm.StartSubcontainer(&sentryapi.StartArgs{
+					Spec: &specs.Spec{},
+					Conf: &config.Config{},
+					CID:  "business",
+				}, nil)
+			},
+		},
+		{
+			name: "RestoreSubcontainer",
+			call: func(cm *containerManager) error {
+				return cm.RestoreSubcontainer(&sentryapi.StartArgs{}, nil)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm, locker := newRestoreWaitTestManager()
+			result := make(chan error, 1)
+			go func() { result <- tc.call(cm) }()
+			waitForRestoreWaiter(t, locker)
+
+			broadcastRestoreState(cm, restoreFailed, wantErr)
+			select {
+			case err := <-result:
+				if err != wantErr {
+					t.Fatalf("handler error = %v, want original initialization error %v", err, wantErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("handler remained blocked after initialization failed")
+			}
+		})
+	}
+}
+
+// A real initialization error must be shared by concurrent callers, rather
+// than allowing the losing callers to initialize another checkpoint.
+func TestLoadCheckpointCachesFailure(t *testing.T) {
+	cm := &containerManager{l: &Loader{}}
+	const callers = 16
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			<-start
+			results <- cm.loadCheckpoint(&sentryapi.RestoreOpts{SplitFSRestore: true}, false, starttime.Timer("Restore"))
+		}()
+	}
+	close(start)
+	var first error
+	for i := 0; i < callers; i++ {
+		select {
+		case err := <-results:
+			if err == nil {
+				t.Fatal("loadCheckpoint() succeeded with missing split filesystem restore files")
+			}
+			if first == nil {
+				first = err
+			} else if err != first {
+				t.Fatalf("loadCheckpoint() = %v, want the same cached error %v", err, first)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("loadCheckpoint() remained blocked")
+		}
+	}
+	// These arguments would fail differently if initialization were retried.
+	if err := cm.loadCheckpoint(&sentryapi.RestoreOpts{}, true, starttime.Timer("Restore")); err != first {
+		t.Fatalf("second loadCheckpoint() = %v, want cached error %v", err, first)
+	}
+}
+
+func TestRestoreInitializationFailureIsTerminal(t *testing.T) {
+	for _, fromSubcontainer := range []bool{false, true} {
+		name := "root"
+		if fromSubcontainer {
+			name = "started_no_root"
+		}
+		t.Run(name, func(t *testing.T) {
+			l := &Loader{state: created}
+			if fromSubcontainer {
+				l.state = started
+				l.noRootContainer.enabled = true
+			}
+			cm := &containerManager{l: l}
+			err := cm.Restore(&sentryapi.RestoreOpts{
+				FromSubcontainer: fromSubcontainer,
+				SplitFSRestore:   true,
+				FilePayload:      urpc.FilePayload{Files: []*os.File{os.Stdin}},
+			}, nil)
+			if err == nil || err != cm.checkpointInitErr {
+				t.Fatalf("Restore() = %v, want cached initialization failure %v", err, cm.checkpointInitErr)
+			}
+			if l.state != restoreFailed || cm.restoreInitializing || !errors.Is(l.restoreErr, err) {
+				t.Fatalf("failure not published: state=%s, initializing=%t, error=%v", l.state, cm.restoreInitializing, l.restoreErr)
+			}
+			if got := cm.Restore(&sentryapi.RestoreOpts{}, nil); got != l.restoreErr {
+				t.Fatalf("repeated Restore() = %v, want terminal error %v", got, l.restoreErr)
+			}
+			if got := cm.RestoreSubcontainer(&sentryapi.StartArgs{}, nil); got != l.restoreErr {
+				t.Fatalf("RestoreSubcontainer() = %v, want terminal error %v", got, l.restoreErr)
+			}
+		})
+	}
+}
 
 func TestTSCOffsetFromSnapshot(t *testing.T) {
 	const (

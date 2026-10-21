@@ -241,6 +241,12 @@ type Loader struct {
 
 	noRootContainer noRootContainer
 
+	// noRootKernelStarted is false while a started no-root sandbox is waiting
+	// for its first business container to start or restore.
+	//
+	// +checklocks:mu
+	noRootKernelStarted bool
+
 	// mountHints provides extra information about mounts for containers that
 	// apply to the entire pod.
 	mountHints *sentryapi.PodMountHints
@@ -1137,6 +1143,14 @@ func (l *Loader) Destroy() {
 
 	ctx := l.k.SupervisorContext()
 	l.mu.Lock()
+	if l.restoreDone != nil {
+		if l.state == restoringUnstarted {
+			l.state = restoreFailed
+			l.restoreErr = fmt.Errorf("sandbox stopped before all containers were restored")
+		}
+		// A no-root sandbox may stop before any checkpoint arrives.
+		l.restoreDone.Broadcast()
+	}
 	for _, m := range l.sharedMounts {
 		m.DecRef(ctx)
 	}
@@ -1357,6 +1371,34 @@ func (l *Loader) Run() error {
 
 // +checklocksexclude:l.mu
 func (l *Loader) run() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.runLocked()
+}
+
+// runLocked starts the application kernel. A no-root sandbox first acknowledges
+// start without consuming the network FDs or installing seccomp; its first
+// business container determines whether to start a fresh kernel or restore one.
+//
+// +checklocks:l.mu
+func (l *Loader) runLocked() error {
+	eid := execID{cid: l.sandboxID}
+	ep, ok := l.processes[eid]
+	if !ok {
+		return fmt.Errorf("trying to start deleted container %q", l.sandboxID)
+	}
+
+	if l.noRootContainer.enabled && l.state == created {
+		l.startSignalForwarding()
+		// Acknowledge watchdog startup even while there are no guest tasks.
+		// Its monitor parks until the kernel has task activity.
+		l.watchdog.Start()
+		l.state = started
+		return nil
+	}
+	if l.state == started && (!l.noRootContainer.enabled || l.noRootKernelStarted) {
+		return fmt.Errorf("kernel has already started")
+	}
 	if l.root.conf.Network == config.NetworkHost {
 		// Delay host network configuration to this point because network namespace
 		// is configured after the loader is created and before Run() is called.
@@ -1368,17 +1410,8 @@ func (l *Loader) run() error {
 		l.startupTimer.Reached("host network configured")
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	eid := execID{cid: l.sandboxID}
-	ep, ok := l.processes[eid]
-	if !ok {
-		return fmt.Errorf("trying to start deleted container %q", l.sandboxID)
-	}
-
 	switch l.state {
-	case created:
+	case created, started:
 		if l.root.conf.ProfileEnable {
 			pprof.Initialize()
 		}
@@ -1453,6 +1486,41 @@ func (l *Loader) run() error {
 		ep.pidns.IncRef()
 	}
 
+	l.startSignalForwarding()
+
+	log.Infof("Process should have started...")
+	l.watchdog.Start()
+	if err := l.k.Start(); err != nil {
+		return err
+	}
+	l.startupTimer.Reached("kernel started")
+	l.root.procArgs.StartupTimeline.End()
+	l.root.procArgs.StartupTimeline = nil
+	switch l.state {
+	case created, started:
+		l.state = started
+	case restoringUnstarted:
+		l.state = restoringStarted
+	default:
+		panic(fmt.Sprintf("state=%s in Loader.run() should be impossible", l.state))
+	}
+	if l.noRootContainer.enabled {
+		l.noRootKernelStarted = true
+	}
+	if l.restoreDone != nil {
+		l.restoreDone.Broadcast()
+	}
+	return nil
+}
+
+// startSignalForwarding installs signal handling once, including while an
+// empty no-root sandbox is waiting for its first business container.
+//
+// +checklocks:l.mu
+func (l *Loader) startSignalForwarding() {
+	if l.stopSignalForwarding != nil {
+		return
+	}
 	// Handle signals by forwarding them to the root container process
 	// (except for panic signal, which should cause a panic).
 	l.stopSignalForwarding = sighandling.StartSignalForwarding(func(sig linux.Signal) {
@@ -1493,24 +1561,6 @@ func (l *Loader) run() error {
 		}
 	})
 	l.startupTimer.Reached("signal forwarding started")
-
-	log.Infof("Process should have started...")
-	l.watchdog.Start()
-	if err := l.k.Start(); err != nil {
-		return err
-	}
-	l.startupTimer.Reached("kernel started")
-	l.root.procArgs.StartupTimeline.End()
-	l.root.procArgs.StartupTimeline = nil
-	switch l.state {
-	case created:
-		l.state = started
-	case restoringUnstarted:
-		l.state = restoringStarted
-	default:
-		panic(fmt.Sprintf("state=%s in Loader.run() should be impossible", l.state))
-	}
-	return nil
 }
 
 // createSubcontainer creates a new container inside the sandbox.
@@ -1545,6 +1595,12 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	ep := l.processes[execID{cid: cid}]
 	if ep == nil {
 		return fmt.Errorf("trying to start a deleted container %q", cid)
+	}
+
+	if l.noRootContainer.enabled && l.state == started && !l.noRootKernelStarted {
+		if err := l.runLocked(); err != nil {
+			return fmt.Errorf("starting no-root kernel: %w", err)
+		}
 	}
 
 	// Create credentials. We reuse the root user namespace because the
@@ -1964,7 +2020,18 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	l.mu.Lock()
 	state := l.state
-	if state == restoringUnstarted {
+	pendingNoRoot := l.noRootContainer.enabled && cid == l.sandboxID && state == started && !l.noRootKernelStarted
+	if pendingNoRoot {
+		select {
+		case <-l.noRootContainer.exit:
+			pendingNoRoot = false
+		default:
+		}
+	}
+	if pendingNoRoot || state == restoringUnstarted {
+		if l.restoreDone == nil {
+			l.restoreDone = sync.NewCond(&l.mu)
+		}
 		log.Infof("Waiting for the container to restore, CID: %q", cid)
 		l.restoreDone.Wait()
 		l.mu.Unlock()
@@ -2034,14 +2101,23 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 func (l *Loader) waitRestore() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.state == restored || l.state == restoreFailed {
-		return l.restoreErr
+	for l.state != restored && l.state != restoreFailed {
+		pendingNoRoot := l.noRootContainer.enabled && l.state == started && !l.noRootKernelStarted
+		if pendingNoRoot {
+			select {
+			case <-l.noRootContainer.exit:
+				return fmt.Errorf("sandbox stopped before checkpoint restore")
+			default:
+			}
+		}
+		if !pendingNoRoot && l.state != restoringUnstarted && l.state != restoringStarted {
+			return fmt.Errorf("sandbox is not being restored, cannot wait for restore: state=%s", l.state)
+		}
+		if l.restoreDone == nil {
+			l.restoreDone = sync.NewCond(&l.mu)
+		}
+		l.restoreDone.Wait()
 	}
-	if l.state != restoringUnstarted && l.state != restoringStarted {
-		return fmt.Errorf("sandbox is not being restored, cannot wait for restore: state=%s", l.state)
-	}
-	log.Infof("Waiting for the sandbox to restore")
-	l.restoreDone.Wait()
 	return l.restoreErr
 }
 

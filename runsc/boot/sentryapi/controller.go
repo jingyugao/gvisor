@@ -121,6 +121,9 @@ type RestoreOpts struct {
 	HavePagesFile  bool
 	HaveDeviceFile bool
 	Background     bool
+	// FromSubcontainer identifies a restore request issued while restoring a
+	// subcontainer in a no-root sandbox.
+	FromSubcontainer bool
 
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing

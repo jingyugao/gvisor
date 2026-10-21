@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -47,6 +48,7 @@ import (
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
 	"gvisor.dev/gvisor/runsc/version"
@@ -368,6 +370,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	if cm.l.state != created {
 		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
 	}
+	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
 	defer func() {
 		if retErr != nil {
 			cu.Clean() // Release `cm.l.mu` as onRestoreFailed will acquire it.
@@ -383,6 +386,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 			return fmt.Errorf("split filesystem restore requested, but sandbox was created without filesystem restore files")
 		}
 		return fmt.Errorf("filesystem restore files were donated during sandbox creation, but split filesystem restore was not requested")
+	}
+	if o.SplitFSRestore && o.LazyPages != (cm.l.root.conf.RestorePageLoading == config.RestorePageLoadingLazy) {
+		return fmt.Errorf("split filesystem restore requires the same restore-page-loading mode used during sandbox creation")
 	}
 
 	if len(o.Files) == 0 {
@@ -405,6 +411,14 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		}
 	}()
 	timer.Reached("got restore readers")
+	if o.LazyPages {
+		if !o.Background {
+			return fmt.Errorf("lazy checkpoint page loading requires background restore")
+		}
+		if pagesFile == nil {
+			return fmt.Errorf("lazy checkpoint page loading requires an uncompressed checkpoint with a pages file")
+		}
+	}
 
 	cm.restorer = &restorer{
 		cm:         cm,
@@ -421,7 +435,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{DisableBackground: o.LazyPages}) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")
@@ -434,7 +448,6 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	stateFile = nil
 	timer.Reached("created statefile reader")
 
-	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
 	cm.l.state = restoringUnstarted
 
 	// Release `cm.l.mu`.

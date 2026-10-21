@@ -1314,6 +1314,10 @@ type AsyncPagesFileLoad struct {
 	// priority is protected by mu.
 	priority ringdeque.Deque[aplFileRange]
 
+	// priorityWake coalesces demand notifications for interruptible readers.
+	// Only the loader consumes tokens; demand producers never call the reader.
+	priorityWake chan struct{}
+
 	// lfStatus communicates MemoryFile.LoadFrom() state to the async page
 	// loader goroutine.
 	lfStatus syncevent.Waiter
@@ -1358,6 +1362,9 @@ type AsyncPagesFileLoad struct {
 
 	// ar is the pages file. ar is immutable.
 	ar stateio.AsyncReader
+
+	// disableBackground prevents reads of pages without waiters. Immutable.
+	disableBackground bool
 
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
@@ -1497,9 +1504,16 @@ func (op *aplOp) off() int64 {
 	return int64(op.end - op.total)
 }
 
+// AsyncPagesFileLoadOpts controls loading from a checkpoint pages file.
+type AsyncPagesFileLoadOpts struct {
+	// DisableBackground loads pages only when requested by awaitLoad. The pages
+	// file remains open until all pages have been loaded or discarded.
+	DisableBackground bool
+}
+
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
 // file ar. It takes ownership of ar, even if it returns a non-nil error.
-func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline) (*AsyncPagesFileLoad, error) {
+func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline, opts AsyncPagesFileLoadOpts) (*AsyncPagesFileLoad, error) {
 	maxReadBytes := hostarch.PageRoundDown(ar.MaxReadBytes())
 	if maxReadBytes <= 0 {
 		ar.Close()
@@ -1508,14 +1522,16 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	// Cap maxParallel due to the uint32 range of bitmap.Bitmap.
 	maxParallel := min(ar.MaxParallel(), 1<<30)
 	apfl := &AsyncPagesFileLoad{
-		timeStartWaiters: math.MaxInt64,
-		timeline:         timeline.Fork("async page loading"),
-		doneCallback:     doneCallback,
-		ar:               ar,
-		maxReadBytes:     maxReadBytes,
-		qavail:           maxParallel,
-		opsBusy:          bitmap.New(uint32(maxParallel)),
-		ops:              make([]aplOp, maxParallel),
+		priorityWake:      make(chan struct{}, 1),
+		timeStartWaiters:  math.MaxInt64,
+		timeline:          timeline.Fork("async page loading"),
+		doneCallback:      doneCallback,
+		ar:                ar,
+		disableBackground: opts.DisableBackground,
+		maxReadBytes:      maxReadBytes,
+		qavail:            maxParallel,
+		opsBusy:           bitmap.New(uint32(maxParallel)),
+		ops:               make([]aplOp, maxParallel),
 	}
 	// Mark ops in opsBusy that don't actually exist as permanently busy.
 	for i, n := maxParallel, apfl.opsBusy.Size(); i < n; i++ {
@@ -1605,6 +1621,10 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	})
 	pending := w.pending != 0
 	if pending {
+		select {
+		case apfl.priorityWake <- struct{}{}:
+		default:
+		}
 		w.timeStart = gohacks.Nanotime()
 		if apfl.numWaiters == 0 {
 			apfl.timeStartWaiters = w.timeStart
@@ -1614,6 +1634,8 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	}
 	apfl.mu.Unlock()
 	if pending {
+		// The loader may be idle with no I/O in flight in demand-only mode.
+		apfl.lfStatus.Notify(aplLFPending)
 		if logAwaitedLoads {
 			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), fr, fr.Length())
 		}
@@ -1814,6 +1836,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 	var completions []stateio.Completion
 	var wakeups []*aplWaiter
 	var decRefs []aplFileRange
+	var memoryFilesDone bool
 
 	dropDelayedDecRefs := func() {
 		if len(decRefs) != 0 {
@@ -1873,6 +1896,11 @@ func (apfl *AsyncPagesFileLoad) main() {
 	}
 
 	for {
+		// Acknowledge notifications before examining their associated state, so
+		// requests arriving while we examine it wake the next idle wait.
+		ev := apfl.lfStatus.Receiver().PendingAndAckAll()
+		memoryFilesDone = memoryFilesDone || ev&aplLFDone != 0
+
 		// Enqueue as many reads as possible.
 		if !apfl.canEnqueue() {
 			panic("main loop invariant failed")
@@ -1922,7 +1950,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() {
+		if !apfl.disableBackground && apfl.canEnqueue() {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -1979,15 +2007,29 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 
 		if apfl.qavail == maxParallel {
-			// We are out of work to do.
-			ev := apfl.lfStatus.Wait()
-			if ev&aplLFPending != 0 {
-				// We may have raced with MemoryFile.LoadFrom() inserting into
-				// asyncMemoryFileLoad.unloaded.
-				apfl.lfStatus.Ack(aplLFPending)
-				continue
+			// Discarding cold pages can finish a MemoryFile without an I/O
+			// completion. Retire it here, outside MemoryFile.mu, to preserve
+			// lock order with cancelWasteLoad.
+			apfl.amflsMu.Lock()
+			apfl.mu.Lock()
+			for amfl := apfl.amfls.Front(); amfl != nil; {
+				next := amfl.Next()
+				if amfl.lfDone && amfl.unloaded.IsEmpty() {
+					amfl.minUnloaded.Store(math.MaxUint64)
+					apfl.amfls.Remove(amfl)
+					amfl.f.asyncPageLoad.Store(nil)
+					amfl.timeline.End()
+					if amfl.doneCallback != nil {
+						amfl.doneCallback(nil)
+						amfl.doneCallback = nil
+					}
+				}
+				amfl = next
 			}
-			if ev&aplLFDone != 0 {
+			empty := apfl.amfls.Empty()
+			apfl.mu.Unlock()
+			apfl.amflsMu.Unlock()
+			if memoryFilesDone && empty {
 				// Successfully completed all loading for all MemoryFiles.
 				durTotal := time.Duration(gohacks.Nanotime() - timeStart)
 				apfl.mu.Lock()
@@ -1995,12 +2037,22 @@ func (apfl *AsyncPagesFileLoad) main() {
 				apfl.mu.Unlock()
 				return
 			}
-			panic(fmt.Sprintf("unknown events in lfStatus: %#x", ev))
+			// Cold pages are still needed by future accesses. Metadata
+			// completion alone must not close their checkpoint reader.
+			apfl.lfStatus.Wait()
+			continue
 		}
 
 		// Wait for any number of reads to complete.
 		var err error
-		completions, err = apfl.ar.Wait(completions[:0], 1 /* minCompletions */)
+		if reader, ok := apfl.ar.(stateio.InterruptibleAsyncReader); ok && apfl.canEnqueue() {
+			// A new demand can use spare capacity without waiting for an
+			// unrelated read to finish. Buffered notifications also cover the
+			// interval between checking priority and starting this wait.
+			completions, _, err = reader.WaitInterruptible(completions[:0], 1, apfl.priorityWake)
+		} else {
+			completions, err = apfl.ar.Wait(completions[:0], 1 /* minCompletions */)
+		}
 		if err != nil {
 			log.Warningf("Async page loading failed: stateio.AsyncReader.Wait failed: %v", err)
 			apfl.mu.Lock()
@@ -2123,6 +2175,8 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 			panic(fmt.Sprintf("pages %v becoming waste with %d async load waiters", ulseg.Range(), n))
 		}
 	})
+	// Let the loader retire a MemoryFile whose last cold page was discarded.
+	amfl.pf.lfStatus.Notify(aplLFPending)
 }
 
 type aplUnloadedSetFunctions struct{}

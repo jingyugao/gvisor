@@ -718,6 +718,9 @@ func New(args Args) (*Loader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to set up filesystem checkpoint restore: %w", err)
 		}
+		for i := range fsrOpts {
+			fsrOpts[i].PageLoadOpts.DisableBackground = args.Conf.RestorePageLoading == config.RestorePageLoadingLazy
+		}
 		fsr, err := startFSRestore(fsrOpts)
 		if err != nil {
 			return nil, fmt.Errorf("failed to start filesystem checkpoint restore: %w", err)

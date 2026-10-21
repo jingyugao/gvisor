@@ -34,7 +34,8 @@ type containerManager struct {
 	release <-chan struct{}
 
 	// lateZero delays a zero-valued first reply until another export completes.
-	lateZero <-chan struct{}
+	lateZero  <-chan struct{}
+	zeroFirst bool
 
 	// +checkatomic
 	requests atomic.Int64
@@ -46,6 +47,10 @@ func (cm *containerManager) GetSavings(_ *struct{}, savings *sentryapi.Savings) 
 	if n == 1 && cm.lateZero != nil {
 		// Model a snapshot taken before restoration completes.
 		<-cm.lateZero
+		return nil
+	}
+	if n == 1 && cm.zeroFirst {
+		// Model a no-root sandbox whose root-side Restored flag is still false.
 		return nil
 	}
 	<-cm.release
@@ -152,5 +157,38 @@ func TestConcurrentExportSavings(t *testing.T) {
 				t.Errorf("TimeSaved = %v, want one complete RPC response", got)
 			}
 		})
+	}
+}
+
+func TestExportSavingsRetriesZeroForUnrestoredSandbox(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "control.sock")
+	server, err := controlserver.Create(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	close(release)
+	cm := &containerManager{entered: entered, release: release, zeroFirst: true}
+	server.Register(cm)
+	server.Register(&Metrics{})
+	if err := server.StartServing(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Stop(0) })
+
+	// Deferred restore may be initiated by a child, so the root Sandbox can
+	// retain Restored=false even after the Sentry starts reporting savings.
+	s := &Sandbox{ControlSocketPath: socketPath, NoRootContainer: true}
+	for range 2 {
+		if _, err := s.ExportMetrics(controlapi.MetricsExportOpts{}); err != nil {
+			t.Fatalf("ExportMetrics: %v", err)
+		}
+	}
+	if got := cm.requests.Load(); got != 2 {
+		t.Errorf("GetSavings calls = %d, want 2 after retrying zero savings", got)
+	}
+	if cpu, wall := s.TimeSaved(); cpu != 2*time.Second || wall != 2*time.Minute {
+		t.Errorf("TimeSaved = (%v, %v), want (%v, %v)", cpu, wall, 2*time.Second, 2*time.Minute)
 	}
 }

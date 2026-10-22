@@ -210,32 +210,34 @@ func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *stru
 		return errors.New("start argument missing container ID")
 	}
 	cm.l.mu.Lock()
-	// Validate ordinary-mode admission first. The deferred-start and
-	// checkpoint-initialization states below are only valid in no-root mode.
-	if !cm.l.noRootContainer.enabled {
-		switch cm.l.state {
-		case started, restored, restoringUnstarted:
-		default:
+	for cm.l.state == loadingCheckpoint {
+		if !cm.l.noRootContainer.enabled {
 			state := cm.l.state
 			cm.l.mu.Unlock()
 			return fmt.Errorf("sandbox is not in started state, cannot start subcontainer: state=%s", state)
 		}
-	}
-	for cm.l.state == loadingCheckpoint {
 		cm.l.stateChanged.Wait()
 	}
 	if cm.l.state == restoreFailed {
-		err := cm.l.restoreErr
-		cm.l.mu.Unlock()
-		return err
+		if cm.l.noRootContainer.enabled {
+			err := cm.l.restoreErr
+			cm.l.mu.Unlock()
+			return err
+		}
 	}
 	if cm.l.state == stopping {
-		cm.l.mu.Unlock()
-		return errSandboxStopped
+		if cm.l.noRootContainer.enabled {
+			cm.l.mu.Unlock()
+			return errSandboxStopped
+		}
 	}
 	state := cm.l.state
 	cm.l.mu.Unlock()
-	if state != ready && state != started && state != restored {
+	if state == ready {
+		if !cm.l.noRootContainer.enabled {
+			return fmt.Errorf("sandbox is not in started state, cannot start subcontainer: state=%s", state)
+		}
+	} else if state != started && state != restored {
 		if state == restoringUnstarted {
 			// Translate the `runsc start` to `runsc restore`.
 			// TODO(b/441106898): Move this to the shim once single-shim-per-pod is implemented.
@@ -391,21 +393,26 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	unlock := cleanup.Make(cm.l.mu.Unlock)
 	defer unlock.Clean()
 	noRoot := cm.l.noRootContainer.enabled
-	// Ordinary restore only accepts a newly created sandbox. After this
-	// check, any other state below necessarily belongs to no-root mode.
-	if !noRoot && cm.l.state != created {
-		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
-	}
 	for cm.l.state == loadingCheckpoint {
+		if !noRoot {
+			return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
+		}
 		cm.l.stateChanged.Wait()
 	}
 	if cm.l.state == stopping {
-		return errSandboxStopped
+		if noRoot {
+			return errSandboxStopped
+		}
 	}
 	if cm.l.state == restoreFailed {
-		return cm.l.restoreErr
+		if noRoot {
+			return cm.l.restoreErr
+		}
 	}
 	if o.FromSubcontainer && cm.l.state == restoringUnstarted && len(o.Files) != 0 {
+		if !noRoot {
+			return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
+		}
 		// The first request already bound the checkpoint. URPC closes this
 		// request's unused file payload when the handler returns.
 		return nil
@@ -740,24 +747,26 @@ func (cm *containerManager) onRestoreDone(s sentryapi.Savings) {
 func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *struct{}) (retErr error) {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
 	cm.l.mu.Lock()
-	// Ordinary subcontainer restore requires an initialized checkpoint.
-	// Only no-root mode may wait for its initialization here.
-	if !cm.l.noRootContainer.enabled && cm.l.state != restoringUnstarted {
-		state := cm.l.state
-		cm.l.mu.Unlock()
-		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer: state=%s", state)
-	}
 	for cm.l.state == loadingCheckpoint {
+		if !cm.l.noRootContainer.enabled {
+			state := cm.l.state
+			cm.l.mu.Unlock()
+			return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer: state=%s", state)
+		}
 		cm.l.stateChanged.Wait()
 	}
 	if cm.l.state == stopping {
-		cm.l.mu.Unlock()
-		return errSandboxStopped
+		if cm.l.noRootContainer.enabled {
+			cm.l.mu.Unlock()
+			return errSandboxStopped
+		}
 	}
 	if cm.l.state == restoreFailed {
-		err := cm.l.restoreErr
-		cm.l.mu.Unlock()
-		return err
+		if cm.l.noRootContainer.enabled {
+			err := cm.l.restoreErr
+			cm.l.mu.Unlock()
+			return err
+		}
 	}
 	state := cm.l.state
 	r := cm.restorer

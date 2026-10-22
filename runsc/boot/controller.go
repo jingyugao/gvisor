@@ -20,7 +20,6 @@ import (
 	"io"
 	"path"
 	"strconv"
-	"sync"
 	gtime "time"
 
 	"golang.org/x/sys/unix"
@@ -210,9 +209,21 @@ func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *stru
 		return errors.New("start argument missing container ID")
 	}
 	cm.l.mu.Lock()
+	for cm.l.state == loadingCheckpoint {
+		cm.l.stateChanged.Wait()
+	}
+	if cm.l.state == restoreFailed {
+		err := cm.l.restoreErr
+		cm.l.mu.Unlock()
+		return err
+	}
+	if cm.l.state == stopping {
+		cm.l.mu.Unlock()
+		return errSandboxStopped
+	}
 	state := cm.l.state
 	cm.l.mu.Unlock()
-	if state != started && state != restored {
+	if state != ready && state != started && state != restored {
 		if state == restoringUnstarted {
 			// Translate the `runsc start` to `runsc restore`.
 			// TODO(b/441106898): Move this to the shim once single-shim-per-pod is implemented.
@@ -308,6 +319,9 @@ func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *stru
 	}()
 
 	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs, rootfsUpperTarFD); err != nil {
+		if errors.Is(err, errRestoreSubcontainer) {
+			return cm.RestoreSubcontainer(args, nil)
+		}
 		log.Debugf("containerManager.StartSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err
 	}
@@ -362,19 +376,54 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	log.Debugf("containerManager.Restore")
 
 	cm.l.mu.Lock()
-	cu := cleanup.Make(cm.l.mu.Unlock)
-	defer cu.Clean()
-
-	if cm.l.state != created {
-		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
+	for cm.l.state == loadingCheckpoint {
+		cm.l.stateChanged.Wait()
 	}
+	if cm.l.state == stopping {
+		cm.l.mu.Unlock()
+		return errSandboxStopped
+	}
+	if cm.l.state == restoreFailed {
+		err := cm.l.restoreErr
+		cm.l.mu.Unlock()
+		return err
+	}
+	if o.FromSubcontainer && cm.l.noRootContainer.enabled && cm.l.state == restoringUnstarted && len(o.Files) != 0 {
+		// The first request already bound the checkpoint. URPC closes this
+		// request's unused file payload when the handler returns.
+		cm.l.mu.Unlock()
+		return nil
+	}
+	startedNoRoot := o.FromSubcontainer && cm.l.noRootContainer.enabled && cm.l.state == ready
+	if (cm.l.state != created || o.FromSubcontainer) && !startedNoRoot {
+		state := cm.l.state
+		cm.l.mu.Unlock()
+		return fmt.Errorf("cannot restore a container in state=%s", state)
+	}
+	if len(o.Files) == 0 {
+		cm.l.mu.Unlock()
+		return fmt.Errorf("at least one file must be passed to Restore")
+	}
+	// Claim the checkpoint before releasing mu. This is the only transition
+	// into loadingCheckpoint; failures are terminal and cannot be retried.
+	cm.l.state = loadingCheckpoint
+	cm.l.stateChanged.Broadcast()
+	cm.l.mu.Unlock()
 	defer func() {
 		if retErr != nil {
-			cu.Clean() // Release `cm.l.mu` as onRestoreFailed will acquire it.
 			cm.onRestoreFailed(fmt.Errorf("Restore failed: %w", retErr))
 		}
 	}()
 
+	cm.l.kernelMu.Lock()
+	kernelOp := cleanup.Make(cm.l.kernelMu.Unlock)
+	defer kernelOp.Clean()
+	cm.l.mu.Lock()
+	if cm.l.state != loadingCheckpoint {
+		cm.l.mu.Unlock()
+		return errSandboxStopped
+	}
+	cm.l.mu.Unlock()
 	// If filesystem restore files were donated to the loader during sandbox
 	// creation, we must perform a split filesystem restore. Restoring a split
 	// checkpoint without split-fsrestore enabled is not supported.
@@ -383,10 +432,6 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 			return fmt.Errorf("split filesystem restore requested, but sandbox was created without filesystem restore files")
 		}
 		return fmt.Errorf("filesystem restore files were donated during sandbox creation, but split filesystem restore was not requested")
-	}
-
-	if len(o.Files) == 0 {
-		return fmt.Errorf("at least one file must be passed to Restore")
 	}
 
 	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o)
@@ -406,51 +451,38 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	}()
 	timer.Reached("got restore readers")
 
-	cm.restorer = &restorer{
+	r := &restorer{
 		cm:         cm,
 		background: o.Background,
+		started:    startedNoRoot,
 		timer:      timer,
 	}
 
-	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
-	if err != nil {
-		return fmt.Errorf("creating memory file: %v", err)
-	}
-	timer.Reached("created MemoryFile")
-
-	if o.HavePagesFile {
-		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
-		pagesMetadata = nil
-		pagesFile = nil
-		timer.Reached("created async MF loader")
-	}
-
-	cm.restorer.stateFile, cm.restorer.metadata, err = state.NewStatefileReader(stateFile /* transfers ownership on success */, nil)
+	r.stateFile, r.metadata, err = state.NewStatefileReader(stateFile /* transfers ownership on success */, nil)
 	if err != nil {
 		return fmt.Errorf("creating statefile reader: %w", err)
 	}
 	stateFile = nil
 	timer.Reached("created statefile reader")
-
-	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
-	cm.l.state = restoringUnstarted
-
-	// Release `cm.l.mu`.
-	cu.Clean()
+	cu := cleanup.Make(func() {
+		r.stateFile.Close()
+		if r.mainMF != nil {
+			r.mainMF.Destroy()
+		}
+		if r.deviceFile != nil {
+			r.deviceFile.Close()
+		}
+	})
+	defer cu.Clean()
 
 	if o.HaveDeviceFile {
-		cm.restorer.deviceFile, err = o.ReleaseFD(len(o.Files) - 1)
+		r.deviceFile, err = o.ReleaseFD(len(o.Files) - 1)
 		if err != nil {
 			return err
 		}
 	}
 
-	// Pause the kernel while we build a new one.
-	cm.l.k.Pause()
-
-	countStr, ok := cm.restorer.metadata[ContainerCountKey]
+	countStr, ok := r.metadata[ContainerCountKey]
 	if !ok {
 		return errors.New("container count not present in state file")
 	}
@@ -461,10 +493,10 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	if count < 1 {
 		return fmt.Errorf("invalid container count value: %v", count)
 	}
-	cm.restorer.totalContainers = count
-	log.Infof("Restoring a total of %d containers", cm.restorer.totalContainers)
+	r.totalContainers = count
+	log.Infof("Restoring a total of %d containers", r.totalContainers)
 
-	containerSpecs, ok := cm.restorer.metadata[ContainerSpecsKey]
+	containerSpecs, ok := r.metadata[ContainerSpecsKey]
 	if !ok {
 		return fmt.Errorf("container specs not found in metadata during restore")
 	}
@@ -472,18 +504,50 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	if err != nil {
 		return err
 	}
-	cm.restorer.checkpointedSpecs = specs
+	r.checkpointedSpecs = specs
 
-	checkpointVersion := cm.restorer.metadata[VersionKey]
+	checkpointVersion := r.metadata[VersionKey]
 	currentVersion := version.Version()
 	if checkpointVersion != currentVersion {
 		return fmt.Errorf("runsc version does not match across checkpoint restore, checkpoint: %v current: %v", checkpointVersion, currentVersion)
 	}
-	if saved := cm.restorer.metadata[noRootContainerKey] == "true"; saved != cm.l.noRootContainer.enabled {
+	if saved := r.metadata[noRootContainerKey] == "true"; saved != cm.l.noRootContainer.enabled {
 		return fmt.Errorf("checkpoint taken with no-root-container=%t cannot be restored with no-root-container=%t", saved, cm.l.noRootContainer.enabled)
 	}
+
+	// Validate metadata before starting asynchronous page loads, so failures
+	// above can close all donated files without leaving a loader running.
+	r.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	if err != nil {
+		return fmt.Errorf("creating memory file: %v", err)
+	}
+	timer.Reached("created MemoryFile")
+	// Pause the empty kernel while we build its replacement.
+	cm.l.k.Pause()
+
+	cm.l.mu.Lock()
+	if cm.l.state != loadingCheckpoint {
+		err := cm.l.restoreErr
+		cm.l.mu.Unlock()
+		return err
+	}
+	// Publish page loading together with the restorer so shutdown cannot
+	// abandon an asynchronous loader that has no owner.
+	if o.HavePagesFile {
+		r.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, r.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		pagesMetadata = nil
+		pagesFile = nil
+		timer.Reached("created async MF loader")
+	}
+	cm.restorer = r
+	cm.l.state = restoringUnstarted
+	cm.l.stateChanged.Broadcast()
+	cm.l.mu.Unlock()
+	cu.Release()
 	timer.Reached("restorer initialized")
-	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	kernelOp.Clean()
+
+	return r.restoreContainerInfo(cm.l, &cm.l.root)
 }
 
 func getRestoreReaders(o *sentryapi.RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
@@ -583,26 +647,45 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 
 func (cm *containerManager) onRestoreFailed(err error) {
 	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	if cm.l.state == stopping || cm.l.state == restoreFailed || cm.l.state == restored {
+		return
+	}
 	cm.l.state = restoreFailed
 	cm.l.restoreErr = err
-	cm.l.mu.Unlock()
-	cm.l.restoreDone.Broadcast()
 	cm.restorer = nil
+	cm.l.stateChanged.Broadcast()
 }
 
 func (cm *containerManager) onRestoreDone(s sentryapi.Savings) {
 	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	if cm.l.state == stopping || cm.l.state == restoreFailed {
+		return
+	}
 	cm.l.state = restored
 	cm.l.savings = s
-	cm.l.mu.Unlock()
-	cm.l.restoreDone.Broadcast()
 	cm.restorer = nil
+	cm.l.stateChanged.Broadcast()
 }
 
 func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *struct{}) (retErr error) {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
 	cm.l.mu.Lock()
+	for cm.l.state == loadingCheckpoint {
+		cm.l.stateChanged.Wait()
+	}
+	if cm.l.state == stopping {
+		cm.l.mu.Unlock()
+		return errSandboxStopped
+	}
+	if cm.l.state == restoreFailed {
+		err := cm.l.restoreErr
+		cm.l.mu.Unlock()
+		return err
+	}
 	state := cm.l.state
+	r := cm.restorer
 	cm.l.mu.Unlock()
 	if state != restoringUnstarted {
 		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer: state=%s", state)
@@ -679,7 +762,7 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *st
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
 	}
 
-	err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
+	err = r.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
 	if err != nil {
 		log.Debugf("containerManager.RestoreSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err

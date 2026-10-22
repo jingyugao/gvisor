@@ -343,12 +343,22 @@ func TestNoRootContainerSignal(t *testing.T) {
 // TestNoRootContainerSIGTERM checks that SIGTERM to the sandbox process stops
 // the sandbox and releases waiters.
 func TestNoRootContainerSIGTERM(t *testing.T) {
-	conf := testutil.TestConfig(t)
+	for _, empty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("empty=%t", empty), func(t *testing.T) {
+			testNoRootContainerSIGTERM(t, testutil.TestConfig(t), empty)
+		})
+	}
+}
+
+func testNoRootContainerSIGTERM(t *testing.T, conf *config.Config, empty bool) {
+	t.Helper()
 	setupTestRootDir(t, conf)
 
 	sbID := testutil.RandomContainerID()
 	sb := startNoRootContainerSandbox(t, conf, sbID)
-	startNoRootContainerSub(t, conf, sbID, nil)
+	if !empty {
+		startNoRootContainerSub(t, conf, sbID, nil)
+	}
 
 	if err := unix.Kill(sb.Sandbox.Pid.Load(), unix.SIGTERM); err != nil {
 		t.Fatalf("error sending SIGTERM to sandbox: %v", err)

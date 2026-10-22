@@ -172,7 +172,7 @@ const (
 	// chosen between a fresh kernel and checkpoint restore.
 	ready
 	// loadingCheckpoint owns the one-time initialization of shared restore
-	// resources. Other container requests wait for this state to change.
+	// resources in no-root mode. Other container requests wait for it.
 	loadingCheckpoint
 	// started indicates that a fresh application kernel is running.
 	// Subsequent containers may still be unstarted.
@@ -187,7 +187,7 @@ const (
 	restoreFailed
 	// restored indicates that the Loader has been fully restored.
 	restored
-	// stopping rejects new work while the sandbox is being torn down.
+	// stopping rejects new work while a no-root sandbox is being torn down.
 	stopping
 )
 
@@ -219,8 +219,8 @@ func (s loaderState) String() string {
 
 // Loader keeps state needed to start the kernel and run the container.
 type Loader struct {
-	// kernelMu serializes checkpoint preparation and kernel replacement with
-	// shutdown. It precedes mu; never wait for it while holding mu.
+	// kernelMu serializes no-root checkpoint preparation and kernel replacement
+	// with shutdown. It precedes mu; never wait for it while holding mu.
 	kernelMu sync.Mutex
 
 	// k is the kernel.
@@ -249,8 +249,13 @@ type Loader struct {
 	// PreSeccompCallback is called right before installing seccomp filters.
 	PreSeccompCallback func()
 
-	// stateChanged wakes callers waiting for checkpoint initialization, kernel
-	// startup, background restore, or shutdown. Its Locker is mu.
+	// restoreDone is used to wait for restore to complete. Note that this may be
+	// much after the sandbox has started because under some configurations, the
+	// restore is allowed to proceed in the background while the sandbox runs.
+	restoreDone *sync.Cond
+
+	// stateChanged wakes no-root callers waiting for checkpoint initialization,
+	// kernel startup, background restore, or shutdown. Its Locker is mu.
 	stateChanged sync.Cond
 
 	// sandboxID is the ID for the whole sandbox.
@@ -1148,8 +1153,10 @@ func createProcessArgs(id string, spec *specs.Spec, conf *config.Config, creds *
 // +checklocksexclude:l.k.fsSaveMu
 func (l *Loader) Destroy() {
 	l.noRootContainer.stop()
-	l.requestStop()
-	l.kernelMu.Lock()
+	if l.noRootContainer.enabled {
+		l.requestStop()
+		l.kernelMu.Lock()
+	}
 	if l.stopSignalForwarding != nil {
 		l.stopSignalForwarding()
 	}
@@ -1175,7 +1182,9 @@ func (l *Loader) Destroy() {
 	// is stopped, since its stop sequence requires all pending RPCs to complete.
 	l.k.SignalAllCheckpointWaiters(fmt.Errorf("Loader destroyed"))
 	l.k.SignalAllFSSaveWaiters(fmt.Errorf("Loader destroyed"))
-	l.kernelMu.Unlock()
+	if l.noRootContainer.enabled {
+		l.kernelMu.Unlock()
+	}
 
 	// Stop the control server. This will indirectly stop any
 	// long-running control operations that are in flight, e.g.
@@ -1184,9 +1193,13 @@ func (l *Loader) Destroy() {
 
 	// Release all kernel resources. This is only safe after we can no longer
 	// save/restore.
-	l.kernelMu.Lock()
+	if l.noRootContainer.enabled {
+		l.kernelMu.Lock()
+	}
 	l.k.Release()
-	l.kernelMu.Unlock()
+	if l.noRootContainer.enabled {
+		l.kernelMu.Unlock()
+	}
 
 	// Release any dangling tcp connections.
 	tcpip.ReleaseDanglingEndpoints()
@@ -1380,6 +1393,13 @@ func (l *Loader) Run() error {
 
 // +checklocksexclude:l.mu
 func (l *Loader) run() error {
+	// Preserve the normal start path's host network setup before taking mu.
+	// A no-root sandbox defers this until its application kernel is selected.
+	if !l.noRootContainer.enabled {
+		if err := l.configureHostNetwork(); err != nil {
+			return err
+		}
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.runLocked()
@@ -1391,10 +1411,10 @@ func (l *Loader) run() error {
 //
 // +checklocks:l.mu
 func (l *Loader) runLocked() error {
-	if l.state == stopping {
-		return errSandboxStopped
-	}
 	if l.noRootContainer.enabled {
+		if l.state == stopping {
+			return errSandboxStopped
+		}
 		select {
 		case <-l.noRootContainer.exit:
 			return errSandboxStopped
@@ -1417,18 +1437,13 @@ func (l *Loader) runLocked() error {
 		l.stateChanged.Broadcast()
 		return nil
 	}
-	if l.state == started {
-		return fmt.Errorf("kernel has already started")
-	}
-	if l.root.conf.Network == config.NetworkHost {
-		// Delay host network configuration to this point because network namespace
-		// is configured after the loader is created and before Run() is called.
-		log.Debugf("Configuring host network")
-		s := l.k.RootNetworkNamespace().Stack().(*hostinet.Stack)
-		if err := s.Configure(l.root.conf.EnableRaw); err != nil {
+	if l.noRootContainer.enabled {
+		if l.state == started {
+			return fmt.Errorf("kernel has already started")
+		}
+		if err := l.configureHostNetwork(); err != nil {
 			return err
 		}
-		l.startupTimer.Reached("host network configured")
 	}
 
 	switch l.state {
@@ -1525,7 +1540,23 @@ func (l *Loader) runLocked() error {
 	default:
 		panic(fmt.Sprintf("state=%s in Loader.run() should be impossible", l.state))
 	}
-	l.stateChanged.Broadcast()
+	if l.noRootContainer.enabled {
+		l.stateChanged.Broadcast()
+	}
+	return nil
+}
+
+func (l *Loader) configureHostNetwork() error {
+	if l.root.conf.Network == config.NetworkHost {
+		// Delay host network configuration to this point because network namespace
+		// is configured after the loader is created and before Run() is called.
+		log.Debugf("Configuring host network")
+		s := l.k.RootNetworkNamespace().Stack().(*hostinet.Stack)
+		if err := s.Configure(l.root.conf.EnableRaw); err != nil {
+			return err
+		}
+		l.startupTimer.Reached("host network configured")
+	}
 	return nil
 }
 
@@ -1534,7 +1565,7 @@ func (l *Loader) runLocked() error {
 //
 // +checklocks:l.mu
 func (l *Loader) startSignalForwarding() {
-	if l.stopSignalForwarding != nil {
+	if l.noRootContainer.enabled && l.stopSignalForwarding != nil {
 		return
 	}
 	// Handle signals by forwarding them to the root container process
@@ -1603,23 +1634,20 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	switch l.state {
-	case loadingCheckpoint, restoringUnstarted:
-		return errRestoreSubcontainer
-	case restoreFailed:
-		return l.restoreErr
-	case ready, started, restored:
-		// The mode is checked again under the lock that creates the process.
-	default:
-		return fmt.Errorf("cannot start subcontainer in state=%s", l.state)
-	}
-
-	ep := l.processes[execID{cid: cid}]
-	if ep == nil {
-		return fmt.Errorf("trying to start a deleted container %q", cid)
-	}
-	if ep.tg != nil {
-		return fmt.Errorf("container %q is already started", cid)
+	if l.noRootContainer.enabled {
+		switch l.state {
+		case loadingCheckpoint, restoringUnstarted:
+			return errRestoreSubcontainer
+		case restoreFailed:
+			return l.restoreErr
+		case ready, started, restored:
+			// Recheck the mode under the lock that creates the process.
+		default:
+			return fmt.Errorf("cannot start subcontainer in state=%s", l.state)
+		}
+		if ep := l.processes[execID{cid: cid}]; ep != nil && ep.tg != nil {
+			return fmt.Errorf("container %q is already started", cid)
+		}
 	}
 
 	cu := cleanup.Make(func() {
@@ -1627,7 +1655,11 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	})
 	defer cu.Clean()
 
-	if l.state == ready {
+	ep := l.processes[execID{cid: cid}]
+	if ep == nil {
+		return fmt.Errorf("trying to start a deleted container %q", cid)
+	}
+	if l.noRootContainer.enabled && l.state == ready {
 		if err := l.runLocked(); err != nil {
 			l.state = restoreFailed
 			l.restoreErr = fmt.Errorf("starting no-root kernel: %w", err)
@@ -2052,8 +2084,16 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 // +checklocksexclude:l.mu
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	l.mu.Lock()
-	for l.state == loadingCheckpoint || l.state == restoringUnstarted || (l.state == ready && cid == l.sandboxID) {
-		l.stateChanged.Wait()
+	if l.noRootContainer.enabled {
+		for l.state == loadingCheckpoint || l.state == restoringUnstarted || (l.state == ready && cid == l.sandboxID) {
+			l.stateChanged.Wait()
+		}
+	} else if l.state == restoringUnstarted {
+		log.Infof("Waiting for the container to restore, CID: %q", cid)
+		l.restoreDone.Wait()
+		l.mu.Unlock()
+		log.Infof("Restore is completed, trying to wait for container %q again.", cid)
+		return l.waitContainer(cid, waitStatus)
 	}
 	state := l.state
 	if l.noRootContainer.enabled && cid == l.sandboxID {
@@ -2117,6 +2157,17 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 func (l *Loader) waitRestore() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if !l.noRootContainer.enabled {
+		if l.state == restored || l.state == restoreFailed {
+			return l.restoreErr
+		}
+		if l.state != restoringUnstarted && l.state != restoringStarted {
+			return fmt.Errorf("sandbox is not being restored, cannot wait for restore: state=%s", l.state)
+		}
+		log.Infof("Waiting for the sandbox to restore")
+		l.restoreDone.Wait()
+		return l.restoreErr
+	}
 	for {
 		switch l.state {
 		case restored, restoreFailed:
@@ -2189,8 +2240,8 @@ var (
 	errRestoreSubcontainer = errors.New("sandbox selected checkpoint restore")
 )
 
-// requestStop closes admission and releases state waiters before shutdown waits
-// for any in-flight checkpoint I/O or kernel replacement.
+// requestStop closes no-root admission and releases state waiters before
+// shutdown waits for any in-flight checkpoint I/O or kernel replacement.
 func (l *Loader) requestStop() {
 	l.mu.Lock()
 	defer l.mu.Unlock()

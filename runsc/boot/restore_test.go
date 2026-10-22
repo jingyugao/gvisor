@@ -166,7 +166,7 @@ func TestRestoreInitializationFailureIsTerminal(t *testing.T) {
 	// A split restore cannot initialize when no filesystem restore files were
 	// donated at sandbox creation. The first failure is terminal and cached in
 	// Loader state for later Restore RPCs.
-	l := &Loader{state: created}
+	l := &Loader{state: created, noRootContainer: noRootContainer{enabled: true}}
 	cm := &containerManager{l: l}
 	err := cm.Restore(&sentryapi.RestoreOpts{
 		SplitFSRestore: true,
@@ -356,7 +356,7 @@ func TestRestoreContainerInfoRejectsTerminalLoaderStates(t *testing.T) {
 		{name: "restoreFailed", state: restoreFailed, restoreErr: failedErr},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			l := &Loader{state: tc.state, restoreErr: tc.restoreErr}
+			l := &Loader{state: tc.state, restoreErr: tc.restoreErr, noRootContainer: noRootContainer{enabled: true}}
 			original := &containerInfo{cid: "original", containerName: "original"}
 			r := &restorer{
 				totalContainers: 2,
@@ -389,7 +389,7 @@ func TestOnRestoreFailedIgnoresTerminalLoaderStates(t *testing.T) {
 		{name: "restoreFailed", state: restoreFailed, restoreErr: errors.New("original restore failure")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			l := &Loader{state: tc.state, restoreErr: tc.restoreErr}
+			l := &Loader{state: tc.state, restoreErr: tc.restoreErr, noRootContainer: noRootContainer{enabled: true}}
 			r := &restorer{}
 			cm := &containerManager{l: l, restorer: r}
 			cm.onRestoreFailed(errors.New("late restore failure"))

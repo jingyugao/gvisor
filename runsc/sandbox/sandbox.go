@@ -568,8 +568,8 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
-	fromSubcontainer := !specutils.IsRootContainer(spec)
-	if imagePath == "" {
+	fromSubcontainer := s.NoRootContainer && !specutils.IsRootContainer(spec)
+	if fromSubcontainer && imagePath == "" {
 		return fmt.Errorf("image-path is required for restore")
 	}
 
@@ -590,7 +590,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
 		return err
 	}
-	// The platform device is needed only when the checkpoint is restored.
+	// If the platform needs a device FD we must pass it in.
 	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
 		return err
 	} else if deviceFile != nil {

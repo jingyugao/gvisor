@@ -320,16 +320,18 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// A request can wait here while another container finishes restoring or
-	// shutdown begins. Recheck before changing the container list or timer.
-	l.mu.Lock()
-	state, restoreErr := l.state, l.restoreErr
-	l.mu.Unlock()
-	if state == restoreFailed {
-		return restoreErr
-	}
-	if state != restoringUnstarted {
-		return fmt.Errorf("cannot register restored container in state=%s", state)
+	if l.noRootContainer.enabled {
+		// A no-root request can wait here while another container finishes
+		// restoring or shutdown begins. Recheck before changing shared state.
+		l.mu.Lock()
+		state, restoreErr := l.state, l.restoreErr
+		l.mu.Unlock()
+		if state == restoreFailed {
+			return restoreErr
+		}
+		if state != restoringUnstarted {
+			return fmt.Errorf("cannot register restored container in state=%s", state)
+		}
 	}
 
 	for _, container := range r.containers {
@@ -375,13 +377,15 @@ func (r *restoreMounts) String() string {
 
 func (r *restorer) restore(l *Loader) (retErr error) {
 	log.Infof("Starting to restore %d containers", len(r.containers))
-	l.kernelMu.Lock()
-	defer l.kernelMu.Unlock()
-	l.mu.Lock()
-	state := l.state
-	l.mu.Unlock()
-	if state != restoringUnstarted {
-		return fmt.Errorf("cannot restore kernel in state=%s", state)
+	if l.noRootContainer.enabled {
+		l.kernelMu.Lock()
+		defer l.kernelMu.Unlock()
+		l.mu.Lock()
+		state := l.state
+		l.mu.Unlock()
+		if state != restoringUnstarted {
+			return fmt.Errorf("cannot restore kernel in state=%s", state)
+		}
 	}
 
 	// Validate the container specs to ensure they did not meaningfully change
@@ -415,34 +419,38 @@ func (r *restorer) restore(l *Loader) (retErr error) {
 	// Start the old watchdog before replacing it with a new one below.
 	l.watchdog.Start()
 
-	// Keep the initialized, empty kernel until the replacement can run. If
-	// loading fails, shutdown must not call Kill or Release on a partially
-	// decoded kernel. kernelMu excludes WaitExit and Destroy during this swap.
-	oldKernel := l.k
-	oldWatchdog := l.watchdog
-	defer func() {
-		if retErr == nil {
-			oldKernel.Release()
-			return
-		}
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		l.k = oldKernel
-		if l.watchdog != oldWatchdog {
-			l.watchdog.Start()
-			l.watchdog.Stop()
-			l.watchdog = oldWatchdog
-		}
-		// The failed replacement's tasks were never started. Do not let Wait
-		// RPCs wait on them; restore failure is reported through loader state.
-		for _, ep := range l.processes {
-			ep.tg = nil
-		}
-		l.ctrl.refreshHandlers()
-	}()
+	if l.noRootContainer.enabled {
+		// Keep the empty no-root kernel until its replacement can run. On
+		// failure, WaitExit must not Kill a partially decoded kernel.
+		// kernelMu excludes WaitExit and Destroy during this swap.
+		oldKernel, oldWatchdog := l.k, l.watchdog
+		defer func() {
+			if retErr == nil {
+				oldKernel.Release()
+				return
+			}
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			l.k = oldKernel
+			if l.watchdog != oldWatchdog {
+				l.watchdog.Start()
+				l.watchdog.Stop()
+				l.watchdog = oldWatchdog
+			}
+			// Failed replacement tasks were never started; Wait RPCs must
+			// report restore failure instead of waiting for them.
+			for _, ep := range l.processes {
+				ep.tg = nil
+			}
+			l.ctrl.refreshHandlers()
+		}()
+	}
 	var oldNvidiaDriverVersion nvconf.DriverVersion
 	if l.k != nil {
 		oldNvidiaDriverVersion = l.k.NvidiaDriverVersion
+		if !l.noRootContainer.enabled {
+			l.k.Release()
+		}
 	}
 	l.k = &kernel.Kernel{
 		Platform: p,

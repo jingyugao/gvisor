@@ -382,26 +382,33 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	unlock := cleanup.Make(cm.l.mu.Unlock)
 	defer unlock.Clean()
 	noRoot := cm.l.noRootContainer.enabled
-	if noRoot {
-		for cm.l.state == loadingCheckpoint {
-			cm.l.stateChanged.Wait()
-		}
-		if cm.l.state == stopping {
-			return errSandboxStopped
-		}
-		if cm.l.state == restoreFailed {
-			return cm.l.restoreErr
-		}
-		if o.FromSubcontainer && cm.l.state == restoringUnstarted && len(o.Files) != 0 {
-			// The first request already bound the checkpoint. URPC closes this
-			// request's unused file payload when the handler returns.
-			return nil
-		}
-	}
-	startedNoRoot := noRoot && o.FromSubcontainer && cm.l.state == ready
-	if (cm.l.state != created || (noRoot && o.FromSubcontainer)) && !startedNoRoot {
+	// Ordinary restore only accepts a newly created sandbox. After this
+	// check, any other state below necessarily belongs to no-root mode.
+	if !noRoot && cm.l.state != created {
 		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
 	}
+	for cm.l.state == loadingCheckpoint {
+		cm.l.stateChanged.Wait()
+	}
+	if cm.l.state == stopping {
+		return errSandboxStopped
+	}
+	if cm.l.state == restoreFailed {
+		return cm.l.restoreErr
+	}
+	if o.FromSubcontainer && cm.l.state == restoringUnstarted && len(o.Files) != 0 {
+		// The first request already bound the checkpoint. URPC closes this
+		// request's unused file payload when the handler returns.
+		return nil
+	}
+	wantState := created
+	if noRoot && o.FromSubcontainer {
+		wantState = ready
+	}
+	if cm.l.state != wantState {
+		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
+	}
+	startedNoRoot := cm.l.state == ready
 	if noRoot && len(o.Files) == 0 {
 		return fmt.Errorf("at least one file must be passed to Restore")
 	}

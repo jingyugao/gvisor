@@ -122,6 +122,10 @@ type RestoreOpts struct {
 	HaveDeviceFile bool
 	Background     bool
 
+	// DeferCheckpoint prepares a no-root restore without checkpoint files.
+	// FilePayload must be empty; checkpoint binding is performed separately.
+	DeferCheckpoint bool
+
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
 	// stateipc.AsyncFileServer and providing checkpoint files. In this case,

@@ -357,6 +357,8 @@ func (cm *containerManager) PortForward(opts *sentryapi.PortForwardOpts, _ *stru
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
 func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retErr error) {
+	deferCheckpoint := o.DeferCheckpoint
+
 	timer := starttime.Timer("Restore")
 	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
@@ -368,6 +370,17 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	if cm.l.state != created {
 		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
 	}
+	if deferCheckpoint {
+		if !cm.l.noRootContainer.enabled {
+			return errors.New("deferring checkpoint files requires no-root mode")
+		}
+		if len(o.Files) != 0 {
+			return errors.New("cannot pass files when deferring the checkpoint")
+		}
+	}
+	// Initialize failure notification before preparing the restore or reading
+	// the checkpoint, since either operation can fail.
+	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
 	defer func() {
 		if retErr != nil {
 			cu.Clean() // Release `cm.l.mu` as onRestoreFailed will acquire it.
@@ -385,10 +398,49 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		return fmt.Errorf("filesystem restore files were donated during sandbox creation, but split filesystem restore was not requested")
 	}
 
+	cm.restorer = &restorer{cm: cm}
+	// Create the main MemoryFile without requiring checkpoint files, and
+	// retain it for checkpoint binding.
+	var err error
+	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	if err != nil {
+		return fmt.Errorf("creating memory file: %v", err)
+	}
+	timer.Reached("created MemoryFile")
+	cm.restorer.background = o.Background
+	cm.restorer.timer = timer
+
+	if !deferCheckpoint {
+		if err := cm.initCheckpoint(o); err != nil {
+			return err
+		}
+	}
+
+	cm.l.state = restoringUnstarted
+
+	// Release `cm.l.mu`.
+	cu.Clean()
+
+	// Pause the kernel while we build a new one.
+	cm.l.k.Pause()
+
+	if deferCheckpoint {
+		// Keep totalContainers at zero until the checkpoint is bound, so
+		// registering the root cannot trigger the full sandbox restore.
+		// TODO: Bind the checkpoint before restoring subcontainers.
+		timer.Reached("checkpoint deferred")
+	}
+	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+}
+
+// initCheckpoint initializes checkpoint readers, memory loading, and metadata.
+// The restorer and its main MemoryFile must already be initialized.
+//
+// +checklocks:cm.l.mu
+func (cm *containerManager) initCheckpoint(o *sentryapi.RestoreOpts) error {
 	if len(o.Files) == 0 {
 		return fmt.Errorf("at least one file must be passed to Restore")
 	}
-
 	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o)
 	if err != nil {
 		return err
@@ -404,20 +456,8 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 			pagesFile.Close()
 		}
 	}()
+	timer := cm.restorer.timer
 	timer.Reached("got restore readers")
-
-	cm.restorer = &restorer{
-		cm:         cm,
-		background: o.Background,
-		timer:      timer,
-	}
-
-	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
-	if err != nil {
-		return fmt.Errorf("creating memory file: %v", err)
-	}
-	timer.Reached("created MemoryFile")
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
@@ -434,21 +474,12 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	stateFile = nil
 	timer.Reached("created statefile reader")
 
-	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
-	cm.l.state = restoringUnstarted
-
-	// Release `cm.l.mu`.
-	cu.Clean()
-
 	if o.HaveDeviceFile {
 		cm.restorer.deviceFile, err = o.ReleaseFD(len(o.Files) - 1)
 		if err != nil {
 			return err
 		}
 	}
-
-	// Pause the kernel while we build a new one.
-	cm.l.k.Pause()
 
 	countStr, ok := cm.restorer.metadata[ContainerCountKey]
 	if !ok {
@@ -483,7 +514,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		return fmt.Errorf("checkpoint taken with no-root-container=%t cannot be restored with no-root-container=%t", saved, cm.l.noRootContainer.enabled)
 	}
 	timer.Reached("restorer initialized")
-	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	return nil
 }
 
 func getRestoreReaders(o *sentryapi.RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {

@@ -563,36 +563,52 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 
 // Restore sends the restore call for a container in the sandbox.
 func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
+	deferCheckpoint := conf.DeferCheckpoint
+	if deferCheckpoint {
+		if !s.NoRootContainer || !specutils.IsRootContainer(spec) {
+			return fmt.Errorf("defer-checkpoint requires the root container of a no-root sandbox")
+		}
+		if imagePath != "" {
+			return fmt.Errorf("image-path cannot be used with defer-checkpoint")
+		}
+		if s.FSRestore {
+			return fmt.Errorf("defer-checkpoint does not support split filesystem restore")
+		}
+	}
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
-	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
+	if !deferCheckpoint && !s.FSRestore && HasFSCheckpointManifest(imagePath) {
 		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
 	}
 
 	opt := sentryapi.RestoreOpts{
-		Background:     background,
-		SplitFSRestore: s.FSRestore,
+		Background:      background,
+		SplitFSRestore:  s.FSRestore,
+		DeferCheckpoint: deferCheckpoint,
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {
 			_ = f.Close()
 		}
 	}()
-	if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
-		return err
-	}
+	if !deferCheckpoint {
+		if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
+			return err
+		}
 
-	// If the platform needs a device FD we must pass it in.
-	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
-		return err
-	} else if deviceFile != nil {
-		defer deviceFile.Close()
-		opt.HaveDeviceFile = true
-		opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+		// If the platform needs a device FD we must pass it in when binding
+		// the checkpoint, after the checkpoint files in the payload.
+		if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
+			return err
+		} else if deviceFile != nil {
+			defer deviceFile.Close()
+			opt.HaveDeviceFile = true
+			opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+		}
 	}
 
 	conn, err := s.sandboxConnect()

@@ -761,7 +761,11 @@ func (cm *containerManager) initCheckpointSubcontainer(args *sentryapi.StartArgs
 	if r.checkpointInit == nil {
 		noRoot := cm.l.noRootContainer.enabled
 		r.checkpointInit = sync.OnceValue(func() error {
-			if err := r.initCheckpoint(&o, noRoot); err != nil {
+			err := r.initCheckpoint(&o, noRoot)
+			if err == nil && r.totalContainers < 2 {
+				err = fmt.Errorf("deferred checkpoint restore requires at least 2 containers, got %d", r.totalContainers)
+			}
+			if err != nil {
 				err = fmt.Errorf("initializing deferred checkpoint: %w", err)
 				// Publish failure before OnceValue releases its waiters.
 				cm.onRestoreFailed(err)

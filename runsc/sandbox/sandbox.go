@@ -815,6 +815,8 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 		if err := s.setRestoreOpts(conf, imagePath, direct, &checkpoint); err != nil {
 			return err
 		}
+		// Copy options without files; URPC sends FDs in the outer payload.
+		// Retain checkpoint's file list for cleanup after the RPC returns.
 		checkpointArgs := checkpoint
 		checkpointArgs.FilePayload.Files = nil
 		args.Checkpoint = &checkpointArgs

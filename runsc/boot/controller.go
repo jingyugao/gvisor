@@ -657,10 +657,11 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *st
 	if args.CID == "" {
 		return errors.New("start argument missing container ID")
 	}
-	if args.NumCheckpointFiles < 0 || args.NumCheckpointFiles > len(args.Files) {
+	numCheckpointFiles := args.Checkpoint.NumFiles()
+	if numCheckpointFiles > len(args.Files) {
 		return errors.New("invalid checkpoint file count")
 	}
-	numContainerFiles := len(args.Files) - args.NumCheckpointFiles
+	numContainerFiles := len(args.Files) - numCheckpointFiles
 	expectedFDs := 1 // At least one FD for the root filesystem.
 	expectedFDs += args.NumGoferFilestoreFDs
 	if args.IsDevIoFilePresent {
@@ -734,25 +735,15 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *st
 // initCheckpointSubcontainer binds and initializes a deferred checkpoint, or
 // waits for an existing initialization. It returns the restore session and the
 // child files without the checkpoint payload. The caller must keep args.Files
-// open until this method returns and validate NumCheckpointFiles against its
-// length before calling.
+// open until this method returns and validate the payload length against
+// args.Checkpoint.NumFiles() before calling.
 //
 // +checklocksexclude:cm.l.mu
 func (cm *containerManager) initCheckpointSubcontainer(args *sentryapi.StartArgs) (*restorer, []*os.File, error) {
-	containerFiles := args.Files[:len(args.Files)-args.NumCheckpointFiles]
+	containerFiles := args.Files[:len(args.Files)-args.Checkpoint.NumFiles()]
 	var o sentryapi.RestoreOpts
 	if args.Checkpoint != nil {
 		o = *args.Checkpoint
-		expectedCheckpointFiles := 1
-		if o.HavePagesFile && !o.UseCheckpointGofer {
-			expectedCheckpointFiles += 2
-		}
-		if o.HaveDeviceFile {
-			expectedCheckpointFiles++
-		}
-		if args.NumCheckpointFiles != expectedCheckpointFiles {
-			return nil, nil, fmt.Errorf("checkpoint arguments must contain %d FDs, but got %d", expectedCheckpointFiles, args.NumCheckpointFiles)
-		}
 		o.Files = args.Files[len(containerFiles):]
 	}
 

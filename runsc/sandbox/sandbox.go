@@ -825,9 +825,8 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 		checkpointArgs := checkpoint
 		checkpointArgs.FilePayload.Files = nil
 		args.Checkpoint = &checkpointArgs
-		args.NumCheckpointFiles = len(checkpoint.FilePayload.Files)
 		// Keep checkpoint descriptors after the child stdio, gofer and device
-		// descriptors. The Sentry splits them using NumCheckpointFiles.
+		// descriptors. The Sentry derives their count from the restore options.
 		args.FilePayload.Files = append(args.FilePayload.Files, checkpoint.FilePayload.Files...)
 	}
 	if err := s.call(sentryapi.ContMgrRestoreSubcontainer, &args, nil); err != nil {

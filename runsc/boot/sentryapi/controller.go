@@ -77,9 +77,6 @@ type StartArgs struct {
 	// nested RestoreOpts payload. It is nil for ordinary start requests.
 	Checkpoint *RestoreOpts
 
-	// NumCheckpointFiles is the number of trailing files for Checkpoint.
-	NumCheckpointFiles int
-
 	// FilePayload contains, in order:
 	//   * stdin, stdout, and stderr (optional: if terminal is disabled).
 	//   * file descriptors to gofer-backing host files (optional).
@@ -145,6 +142,22 @@ type RestoreOpts struct {
 	// SplitFSRestore indicates if we should restore the filesystem from a
 	// split filesystem checkpoint.
 	SplitFSRestore bool `json:"split_fsrestore"`
+}
+
+// NumFiles returns the number of payload FDs required by these restore options.
+// A nil receiver represents a request without a checkpoint payload.
+func (o *RestoreOpts) NumFiles() int {
+	if o == nil {
+		return 0
+	}
+	n := 1 // State file or checkpoint Gofer socket.
+	if o.HavePagesFile && !o.UseCheckpointGofer {
+		n += 2
+	}
+	if o.HaveDeviceFile {
+		n++
+	}
+	return n
 }
 
 // ContMgrRestoreSubcontainer restores a container from a statefile.

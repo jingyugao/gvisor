@@ -218,6 +218,14 @@ func newProcInternalData(conf *config.Config, spec *specs.Spec) *proc.InternalDa
 type restorer struct {
 	mu sync.Mutex
 
+	// checkpointInit initializes the bound checkpoint. In deferred mode, it is
+	// nil until files are supplied, then a sync.OnceValue function caches the
+	// initialization result. After ordinary root initialization, it returns nil.
+	// Installing and reading this function is protected by cm.l.mu; child
+	// callers invoke it without that lock so checkpoint I/O does not block
+	// other Loader operations.
+	checkpointInit func() error
+
 	// totalContainers is the number of containers expected to be restored in
 	// the sandbox. Sandbox restore can only happen, after all containers have
 	// been restored.

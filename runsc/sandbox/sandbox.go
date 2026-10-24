@@ -249,6 +249,11 @@ type Sandbox struct {
 	// Restored will be true when the sandbox has been restored.
 	Restored bool `json:"restored"`
 
+	// DeferCheckpoint is true when the sandbox was prepared for a deferred
+	// checkpoint restore. It remains set in serialized container metadata so a
+	// later child restore can provide the checkpoint.
+	DeferCheckpoint bool `json:"deferCheckpoint,omitempty"`
+
 	// savingsMu protects the cached time saved by restoration.
 	savingsMu sync.Mutex `nojson:"true"`
 
@@ -647,6 +652,9 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		return fmt.Errorf("restoring container %q: %w", cid, err)
 	}
 	s.Restored = true
+	if deferCheckpoint {
+		s.DeferCheckpoint = true
+	}
 	return nil
 }
 
@@ -751,8 +759,14 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 }
 
 // RestoreSubcontainer sends the restore call for a sub-container in the sandbox.
-func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestoreFiles []*os.File, devIOFile *os.File, goferMountConf []specutils.GoferMountConf) error {
+func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestoreFiles []*os.File, devIOFile *os.File, goferMountConf []specutils.GoferMountConf, imagePath string, direct, background bool) error {
 	log.Debugf("Restore sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.Load())
+	if conf.DeferCheckpoint {
+		return fmt.Errorf("defer-checkpoint requires the root container")
+	}
+	if s.DeferCheckpoint && imagePath == "" {
+		return fmt.Errorf("deferred checkpoint restore requires an explicit child restore with --image-path")
+	}
 
 	if err := s.configureStdios(conf, stdios); err != nil {
 		return err
@@ -781,6 +795,38 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 		IsDevIoFilePresent:   devIOFile != nil,
 		GoferMountConfs:      goferMountConf,
 		FilePayload:          payload,
+	}
+	if s.DeferCheckpoint {
+		if s.FSRestore {
+			return fmt.Errorf("deferred checkpoint restore does not support split filesystem restore")
+		}
+		if HasFSCheckpointManifest(imagePath) {
+			return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
+		}
+
+		checkpoint := sentryapi.RestoreOpts{Background: background}
+		defer func() {
+			for _, f := range checkpoint.FilePayload.Files {
+				_ = f.Close()
+			}
+		}()
+		if err := s.setRestoreOpts(conf, imagePath, direct, &checkpoint); err != nil {
+			return err
+		}
+		if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
+			return err
+		} else if deviceFile != nil {
+			defer deviceFile.Close()
+			checkpoint.HaveDeviceFile = true
+			checkpoint.FilePayload.Files = append(checkpoint.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+		}
+		checkpointArgs := checkpoint
+		checkpointArgs.FilePayload.Files = nil
+		args.Checkpoint = &checkpointArgs
+		args.NumCheckpointFiles = len(checkpoint.FilePayload.Files)
+		// Keep checkpoint descriptors after the child stdio, gofer and device
+		// descriptors. The Sentry splits them using NumCheckpointFiles.
+		args.FilePayload.Files = append(args.FilePayload.Files, checkpoint.FilePayload.Files...)
 	}
 	if err := s.call(sentryapi.ContMgrRestoreSubcontainer, &args, nil); err != nil {
 		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)

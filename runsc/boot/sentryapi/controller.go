@@ -72,12 +72,21 @@ type StartArgs struct {
 	// IsRootfsUpperTarFilePresent indicates whether the rootfs upper tar file is present.
 	IsRootfsUpperTarFilePresent bool
 
+	// Checkpoint contains restore options when a subcontainer binds a deferred
+	// checkpoint. Its files are carried at the end of FilePayload, not in the
+	// nested RestoreOpts payload. It is nil for ordinary start requests.
+	Checkpoint *RestoreOpts
+
+	// NumCheckpointFiles is the number of trailing files for Checkpoint.
+	NumCheckpointFiles int
+
 	// FilePayload contains, in order:
 	//   * stdin, stdout, and stderr (optional: if terminal is disabled).
 	//   * file descriptors to gofer-backing host files (optional).
 	//   * file descriptor for /dev gofer connection (optional)
 	//   * file descriptor for rootfs upper tar file (optional)
 	//   * file descriptors to connect to gofer to serve the root filesystem.
+	//   * checkpoint files, in RestoreOpts order (optional: restore only).
 	urpc.FilePayload
 }
 

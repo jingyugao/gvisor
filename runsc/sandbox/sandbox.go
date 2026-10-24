@@ -246,12 +246,14 @@ type Sandbox struct {
 	// Checkpointed will be true when the sandbox has been checkpointed.
 	Checkpointed bool `json:"checkpointed"`
 
-	// Restored will be true when the sandbox has been restored.
+	// Restored is set after the root restore RPC succeeds. Kernel restoration
+	// may still be waiting for subcontainers.
 	Restored bool `json:"restored"`
 
 	// DeferCheckpoint is true when the sandbox was prepared for a deferred
-	// checkpoint restore. It remains set in serialized container metadata so a
-	// later child restore can provide the checkpoint.
+	// checkpoint restore. It remains set in serialized container metadata so
+	// child restores can supply checkpoint files and refresh their bundle mounts
+	// before creating Gofers.
 	DeferCheckpoint bool `json:"deferCheckpoint,omitempty"`
 
 	// savingsMu protects the cached time saved by restoration.

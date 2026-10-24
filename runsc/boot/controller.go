@@ -353,10 +353,10 @@ func (cm *containerManager) PortForward(opts *sentryapi.PortForwardOpts, _ *stru
 	return nil
 }
 
-// Restore loads a container from a statefile.
-// The container's current kernel is destroyed, a restore environment is
-// created, and the kernel is recreated with the restore state file. The
-// container then sends the signal to start.
+// Restore prepares a restore session and registers the root container. Deferred
+// restores prepare a no-root sandbox without checkpoint files; a subsequent
+// RestoreSubcontainer request supplies them. Subcontainers must be restored
+// after this call returns.
 func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retErr error) {
 	deferCheckpoint := o.DeferCheckpoint
 
@@ -436,9 +436,10 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
 }
 
-// initCheckpoint initializes checkpoint readers, memory loading, and metadata.
-// The main MemoryFile must already be initialized. Deferred initialization must
-// run through checkpointInit; all children must wait for it before registering.
+// initCheckpoint sets up checkpoint readers and memory loading, and validates
+// checkpoint metadata. The main MemoryFile must already exist. Ordinary restores
+// call this from Restore; deferred restores use checkpointInit before registering
+// subcontainers.
 func (r *restorer) initCheckpoint(o *sentryapi.RestoreOpts, noRoot bool) error {
 	if len(o.Files) == 0 {
 		return fmt.Errorf("at least one file must be passed to Restore")

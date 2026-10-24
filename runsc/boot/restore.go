@@ -218,12 +218,11 @@ func newProcInternalData(conf *config.Config, spec *specs.Spec) *proc.InternalDa
 type restorer struct {
 	mu sync.Mutex
 
-	// checkpointInit initializes the bound checkpoint. In deferred mode, it is
-	// nil until files are supplied, then a sync.OnceValue function caches the
-	// initialization result. After ordinary root initialization, it returns nil.
-	// Installing and reading this function is protected by cm.l.mu; child
-	// callers invoke it without that lock so checkpoint I/O does not block
-	// other Loader operations.
+	// checkpointInit waits for checkpoint initialization and returns its result.
+	// Ordinary restores install a no-op after initialization. In deferred mode,
+	// the first child supplying files installs a sync.OnceValue function.
+	// cm.l.mu protects access to this function. Callers invoke it without that
+	// lock so checkpoint I/O does not block other Loader operations.
 	checkpointInit func() error
 
 	// totalContainers is the number of containers expected to be restored in

@@ -25,7 +25,6 @@ import (
 	gtime "time"
 
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -35,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -464,7 +464,9 @@ func (r *restorer) initCheckpoint(o *sentryapi.RestoreOpts, noRoot bool) error {
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		r.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, r.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		// For background restore, throttle page loading until the kernel is
+		// restored, so that restore does not wait behind page reads.
+		r.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, r.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")

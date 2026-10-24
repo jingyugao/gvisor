@@ -568,6 +568,8 @@ func (r *restorer) restore(l *Loader) error {
 				return err
 			}
 			r.timer.Reached("MF metadata loaded")
+			// The kernel is restored; load the remaining pages at full speed.
+			r.asyncMFLoader.Unthrottle()
 		} else {
 			if err := r.asyncMFLoader.Wait(); err != nil {
 				return err
@@ -617,9 +619,9 @@ func (r *restorer) restore(l *Loader) error {
 		specsByCID[cid] = l.containerSpecs[name]
 	}
 	for _, tg := range l.k.RootPIDNamespace().ThreadGroups() {
-		// Find all processes with no parent (root of execution), that were not started
-		// via a call to `exec`.
-		if tg.Leader().Parent() == nil && tg.Leader().Origin != kernel.OriginExec {
+		// Find all container init processes. A process with no parent is not
+		// enough: in a sandbox with no root container, orphans have none.
+		if tg.IsContainerInit() {
 			cid := tg.Leader().ContainerID()
 			proc := l.processes[execID{cid: cid}]
 			if proc == nil {
@@ -643,6 +645,11 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	l.k.RestoreContainerMapping(l.containerIDs)
+	for cid, spec := range specsByCID {
+		if spec != nil && spec.Process != nil {
+			l.k.SetContainerEnv(cid, spec.Process.Env)
+		}
+	}
 	l.k.SetSaver(l)
 	l.createNvproxyDeviceFilesAfterRestore(ctx)
 
@@ -886,6 +893,9 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	if l.noRootContainer.enabled {
 		saveOpts.Metadata[noRootContainerKey] = "true"
 	}
+
+	// Save the sandbox's CPU features.
+	saveOpts.Metadata[sentryapi.CPUFeaturesKey] = strings.Join(l.k.FeatureSet().FeatureNames(), ",")
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())

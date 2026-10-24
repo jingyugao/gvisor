@@ -18,26 +18,34 @@
 package container
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/cleanup"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/sandbox"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // TestSignalUnkillablePolicyRestore verifies that the SignalUnkillablePolicy
@@ -380,6 +388,86 @@ func TestCheckpointRestore(t *testing.T) {
 						return testutil.NewSpecWithArgs("bash", "-c", script)
 					})
 				})
+			}
+		})
+	}
+}
+
+// TestCheckpointCPUFeaturesMetadata verifies that the checkpoint metadata
+// records the sandbox's CPU features, matching the CPUID FeatureSet saved in
+// the state file.
+func TestCheckpointCPUFeaturesMetadata(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			spec, _ := sleepSpecConf(t)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			cont, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForProcessCount(cont, 1); err != nil {
+				t.Fatalf("error waiting for init process: %v", err)
+			}
+
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-cpu-features")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding dir: %v", err)
+			}
+			if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelFlateBestSpeed}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+
+			f, err := os.Open(filepath.Join(dir, checkpointfiles.StateFileName))
+			if err != nil {
+				t.Fatalf("error opening state file: %v", err)
+			}
+			defer f.Close()
+			r, metadata, err := statefile.NewReader(f, nil /* key */)
+			if err != nil {
+				t.Fatalf("error reading state file: %v", err)
+			}
+			defer r.Close()
+
+			got, ok := metadata[sentryapi.CPUFeaturesKey]
+			if !ok {
+				t.Fatalf("metadata key %q not found", sentryapi.CPUFeaturesKey)
+			}
+			if got == "" {
+				t.Fatalf("metadata[%q] is empty", sentryapi.CPUFeaturesKey)
+			}
+
+			// Kernel.saveToLocked saves the CPUID FeatureSet as the first object in
+			// the state stream (which Kernel.LoadFrom also relies on).
+			var fs cpuid.FeatureSet
+			if _, err := state.Load(context.Background(), r, &fs); err != nil {
+				t.Fatalf("error loading CPUID FeatureSet from state file: %v", err)
+			}
+			if want := strings.Join(fs.FeatureNames(), ","); got != want {
+				t.Errorf("metadata[%q] = %q, want %q", sentryapi.CPUFeaturesKey, got, want)
+			}
+			gotMask, err := cpuid.FeatureMaskStringFromNames(strings.Split(got, ","))
+			if err != nil {
+				t.Fatalf("FeatureMaskStringFromNames(%q) failed: %v", got, err)
+			}
+			if wantMask := fs.FeatureMaskString(); gotMask != wantMask {
+				t.Errorf("FeatureMaskStringFromNames(%q) = %q, want %q", got, gotMask, wantMask)
 			}
 		})
 	}
@@ -1760,12 +1848,20 @@ func TestCheckpointRestoreTUN(t *testing.T) {
 // TestMultiBundleSplitFSCheckpointRestore tests saving and restoring multiple
 // independent filesystem checkpoint bundles (e.g. rootfs=/ and fs=/dur-data),
 // including combining bundles from different checkpoints on fresh container
-// start.
+// start. The workload runs either in the root container of its sandbox or in a
+// subcontainer of a sandbox with no root container.
 func TestMultiBundleSplitFSCheckpointRestore(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
 		t.Skip("Checkpoint not supported")
 	}
+	for _, noRootContainer := range []bool{false, true} {
+		t.Run(fmt.Sprintf("noRootContainer=%t", noRootContainer), func(t *testing.T) {
+			testMultiBundleSplitFSCheckpointRestore(t, noRootContainer)
+		})
+	}
+}
 
+func testMultiBundleSplitFSCheckpointRestore(t *testing.T, noRootContainer bool) {
 	const (
 		rootfsPrefix = "rootfs/"
 		fsPrefix     = "bundles/fs"
@@ -1774,20 +1870,23 @@ func TestMultiBundleSplitFSCheckpointRestore(t *testing.T) {
 	)
 
 	conf := overlayTestConfig(t)
+	setupTestRootDir(t, conf)
 	fsSaveDir := makeTempDir(t, "multi-bundle-fssave")
 	checkpointDir := makeTempDir(t, "multi-bundle-checkpoint")
 
 	tmpfsSourceDir := makeTempDir(t, "dur-source")
 	durFile := filepath.Join(durMount, "dur_marker")
+	env := splitFSTestEnv{
+		conf:            conf,
+		noRootContainer: noRootContainer,
+		mountSource:     tmpfsSourceDir,
+		mountDest:       durMount,
+	}
 
 	script := fmt.Sprintf("echo root_val_1 > %q; echo dur_val_1 > %q; while true; do sleep 1; done", rootFile, durFile)
-	spec := testutil.NewSpecWithArgs("bash", "-c", script)
-	spec.Root.Readonly = false
-	addTmpfsMount(spec, "dur-mount", tmpfsSourceDir, durMount)
-	bundleDir := setupBundle(t, conf, spec)
-
-	cont := startContainer(t, conf, spec, bundleDir, nil)
-	waitForGuestFiles(t, conf, cont, rootFile, durFile)
+	appArgs := []string{"bash", "-c", script}
+	sb, app := env.start(t, nil /* mutateArgs */, appArgs...)
+	waitForGuestFiles(t, conf, app, rootFile, durFile)
 
 	bundleSpecs := []string{
 		rootfsPrefix + "=/",
@@ -1796,7 +1895,7 @@ func TestMultiBundleSplitFSCheckpointRestore(t *testing.T) {
 
 	// Save an initial multi-bundle filesystem checkpoint while keeping the
 	// container running.
-	if err := cont.FSSave(conf, fsSaveDir, sandbox.FSSaveOpts{Paths: bundleSpecs}); err != nil {
+	if err := sb.FSSave(conf, fsSaveDir, sandbox.FSSaveOpts{Paths: bundleSpecs}); err != nil {
 		t.Fatalf("error saving filesystem checkpoint: %v", err)
 	}
 	checkFSCheckpointFiles(t, fsSaveDir, rootfsPrefix)
@@ -1805,14 +1904,12 @@ func TestMultiBundleSplitFSCheckpointRestore(t *testing.T) {
 	// Mutate both filesystems before taking a full split checkpoint so the two
 	// checkpoints have distinct states.
 	mutateScript := fmt.Sprintf("echo root_val_2 > %q && echo dur_val_2 > %q", rootFile, durFile)
-	if ws, err := execute(conf, cont, "/bin/bash", "-c", mutateScript); err != nil || ws.ExitStatus() != 0 {
+	if ws, err := execute(conf, app, "/bin/bash", "-c", mutateScript); err != nil || ws.ExitStatus() != 0 {
 		t.Fatalf("failed to mutate files before second checkpoint: ws=%v, err=%v", ws, err)
 	}
 
 	// Checkpoint with two bundles: rootfs and fs.
-	if err := cont.Checkpoint(conf, checkpointDir, sandbox.CheckpointOpts{SplitFSCheckpointPaths: bundleSpecs}); err != nil {
-		t.Fatalf("error checkpointing container: %v", err)
-	}
+	env.checkpoint(t, sb, checkpointDir, sandbox.CheckpointOpts{SplitFSCheckpointPaths: bundleSpecs})
 	checkFSCheckpointFiles(t, checkpointDir, rootfsPrefix)
 	checkFSCheckpointFiles(t, checkpointDir, fsPrefix)
 
@@ -1837,37 +1934,435 @@ func TestMultiBundleSplitFSCheckpointRestore(t *testing.T) {
 		},
 	} {
 		t.Run(rtc.name, func(t *testing.T) {
-			contRestore := newContainer(t, conf, spec, bundleDir, func(args *Args) {
+			_, appRestore := env.restore(t, rtc.restoreDir, func(args *Args) {
 				args.FSRestoreImagePaths = rtc.fsRestorePath
 				if rtc.mutateArgs != nil {
 					rtc.mutateArgs(args)
 				}
-			})
-			if err := contRestore.Restore(conf, rtc.restoreDir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
-				t.Fatalf("error restoring container: %v", err)
-			}
-			checkGuestFile(t, conf, contRestore, rootFile, "root_val_2")
-			checkGuestFile(t, conf, contRestore, durFile, "dur_val_2")
+			}, appArgs...)
+			checkGuestFile(t, conf, appRestore, rootFile, "root_val_2")
+			checkGuestFile(t, conf, appRestore, durFile, "dur_val_2")
 		})
 	}
 
 	t.Run("StartFreshCombiningBundlesFromDifferentCheckpoints", func(t *testing.T) {
-		specFresh := testutil.NewSpecWithArgs("sleep", "100")
-		specFresh.Root.Readonly = false
-		addTmpfsMount(specFresh, "dur-mount", tmpfsSourceDir, durMount)
-		bundleDirFresh := setupBundle(t, conf, specFresh)
-
-		contFresh := startContainer(t, conf, specFresh, bundleDirFresh, func(args *Args) {
+		_, appFresh := env.start(t, func(args *Args) {
 			args.FSRestoreImagePaths = []string{
 				filepath.Join(fsSaveDir, rootfsPrefix),
 				filepath.Join(checkpointDir, fsPrefix),
 			}
-		})
-		if err := contFresh.WaitFSRestore(); err != nil {
+		}, "sleep", "100")
+		if err := appFresh.WaitFSRestore(); err != nil {
 			t.Fatalf("error waiting for filesystem restore: %v", err)
 		}
 
-		checkGuestFile(t, conf, contFresh, rootFile, "root_val_1")
-		checkGuestFile(t, conf, contFresh, durFile, "dur_val_2")
+		checkGuestFile(t, conf, appFresh, rootFile, "root_val_1")
+		checkGuestFile(t, conf, appFresh, durFile, "dur_val_2")
 	})
+}
+
+// splitFSTestEnv starts, checkpoints and restores the sandboxes of a split
+// filesystem checkpoint test.
+type splitFSTestEnv struct {
+	conf            *config.Config
+	noRootContainer bool
+	mountSource     string
+	mountDest       string
+}
+
+func (e *splitFSTestEnv) newSpecs(sbID string, args ...string) (sbSpec, appSpec *specs.Spec) {
+	if !e.noRootContainer {
+		spec := testutil.NewSpecWithArgs(args...)
+		spec.Root.Readonly = false
+		addTmpfsMount(spec, "dur-mount", e.mountSource, e.mountDest)
+		return spec, spec
+	}
+	sbSpec = noRootContainerSandboxSpec()
+	appSpec = noRootContainerSubSpec(sbID, args...)
+	appSpec.Annotations[specutils.ContainerdContainerNameAnnotation] = "app"
+	appSpec.Root.Readonly = false
+	addTmpfsMountToContainer(sbSpec, appSpec, "dur-mount", e.mountSource, e.mountDest)
+	return sbSpec, appSpec
+}
+
+func (e *splitFSTestEnv) sandboxArgs(sbID string, mutateArgs func(*Args)) func(*Args) {
+	return func(args *Args) {
+		args.ID = sbID
+		args.NoRootContainer = e.noRootContainer
+		if mutateArgs != nil {
+			mutateArgs(args)
+		}
+	}
+}
+
+func (e *splitFSTestEnv) start(t *testing.T, mutateArgs func(*Args), args ...string) (sb, app *Container) {
+	t.Helper()
+	sbID := testutil.RandomContainerID()
+	sbSpec, appSpec := e.newSpecs(sbID, args...)
+	sb = startContainer(t, e.conf, sbSpec, newBundleDir(t, sbSpec), e.sandboxArgs(sbID, mutateArgs))
+	if !e.noRootContainer {
+		return sb, sb
+	}
+	return sb, startContainer(t, e.conf, appSpec, newBundleDir(t, appSpec), nil /* mutateArgs */)
+}
+
+func (e *splitFSTestEnv) restore(t *testing.T, imagePath string, mutateArgs func(*Args), args ...string) (sb, app *Container) {
+	t.Helper()
+	restoreOne := func(spec *specs.Spec, mutateArgs func(*Args)) *Container {
+		t.Helper()
+		c := newContainer(t, e.conf, spec, newBundleDir(t, spec), mutateArgs)
+		if err := c.Restore(e.conf, imagePath, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+			t.Fatalf("error restoring container: %v", err)
+		}
+		return c
+	}
+	sbID := testutil.RandomContainerID()
+	sbSpec, appSpec := e.newSpecs(sbID, args...)
+	sb = restoreOne(sbSpec, e.sandboxArgs(sbID, mutateArgs))
+	if !e.noRootContainer {
+		return sb, sb
+	}
+	app = restoreOne(appSpec, nil /* mutateArgs */)
+	if err := sb.WaitRestore(); err != nil {
+		t.Fatalf("error waiting for restore: %v", err)
+	}
+	return sb, app
+}
+
+func (e *splitFSTestEnv) checkpoint(t *testing.T, sb *Container, imagePath string, opts sandbox.CheckpointOpts) {
+	t.Helper()
+	if e.noRootContainer {
+		checkpointNoRootContainer(t, e.conf, sb, imagePath, opts)
+		return
+	}
+	if err := sb.Checkpoint(e.conf, imagePath, opts); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+}
+
+func newBundleDir(t *testing.T, spec *specs.Spec) string {
+	t.Helper()
+	bundleDir, cleanupBundle, err := testutil.SetupBundleDir(spec)
+	if err != nil {
+		t.Fatalf("error setting up bundle: %v", err)
+	}
+	t.Cleanup(cleanupBundle)
+	return bundleDir
+}
+
+func adjustSnapshotMetadata(dir string, updateFn func(map[string]string)) error {
+	stateFilePath := filepath.Join(dir, checkpointfiles.StateFileName)
+	raw, err := os.ReadFile(stateFilePath)
+	if err != nil {
+		return err
+	}
+	const magicLen = 8
+	if len(raw) < magicLen+8 {
+		return fmt.Errorf("statefile too small")
+	}
+	magic := raw[:magicLen]
+	metaLen := binary.BigEndian.Uint64(raw[magicLen : magicLen+8])
+	if uint64(len(raw)) < uint64(magicLen)+8+metaLen {
+		return fmt.Errorf("statefile corrupt: metadata length exceeds file size")
+	}
+	metaBytes := raw[magicLen+8 : uint64(magicLen)+8+metaLen]
+	payload := raw[uint64(magicLen)+8+metaLen:]
+
+	var meta map[string]string
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return fmt.Errorf("unmarshaling metadata: %w", err)
+	}
+	updateFn(meta)
+
+	newMetaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshaling metadata: %w", err)
+	}
+
+	var buf bytes.Buffer
+	buf.Write(magic)
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(newMetaBytes)))
+	buf.Write(lenBuf[:])
+	buf.Write(newMetaBytes)
+	buf.Write(payload)
+
+	return os.WriteFile(stateFilePath, buf.Bytes(), 0644)
+}
+
+type clockReading struct {
+	vdso int64
+	sys  int64
+	diff int64
+	tsc  uint64
+}
+
+func parseClockReadings(t *testing.T, data []byte) []clockReading {
+	t.Helper()
+	var readings []clockReading
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "OK:") {
+			continue
+		}
+		var r clockReading
+		// Format: "OK: vdso=%d sys=%d diff=%d tsc=%d"
+		_, err := fmt.Sscanf(line, "OK: vdso=%d sys=%d diff=%d tsc=%d", &r.vdso, &r.sys, &r.diff, &r.tsc)
+		if err != nil {
+			t.Fatalf("failed to parse clock reading line %q: %v", line, err)
+		}
+		readings = append(readings, r)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("failed to scan clock readings: %v", err)
+	}
+	return readings
+}
+
+func assertMonotonicReadings(t *testing.T, readings []clockReading) {
+	t.Helper()
+	if len(readings) == 0 {
+		t.Fatalf("expected clock readings, got none")
+	}
+	for i := 1; i < len(readings); i++ {
+		prev := readings[i-1]
+		curr := readings[i]
+		if curr.vdso < prev.vdso {
+			t.Fatalf("reading[%d] VDSO went backwards: prev=%d current=%d (delta=%d)", i, prev.vdso, curr.vdso, curr.vdso-prev.vdso)
+		}
+		if curr.sys < prev.sys {
+			t.Fatalf("reading[%d] syscall time went backwards: prev=%d current=%d (delta=%d)", i, prev.sys, curr.sys, curr.sys-prev.sys)
+		}
+		if curr.tsc < prev.tsc {
+			t.Fatalf("reading[%d] RDTSC went backwards: prev=%d current=%d (delta=%d)", i, prev.tsc, curr.tsc, int64(curr.tsc)-int64(prev.tsc))
+		}
+	}
+}
+
+func waitForFileLineCount(f *os.File, minLines int) error {
+	return testutil.Poll(func() error {
+		data, err := os.ReadFile(f.Name())
+		if err != nil {
+			return err
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		count := 0
+		for _, l := range lines {
+			if strings.HasPrefix(l, "OK:") {
+				count++
+			}
+		}
+		if count < minLines {
+			return fmt.Errorf("file %s has %d OK lines, want at least %d", f.Name(), count, minLines)
+		}
+		return nil
+	}, 10*time.Second)
+}
+
+func runAdjustedTSCTest(t *testing.T, conf *config.Config, count int, offsetCycles uint64) {
+	t.Helper()
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-vdso-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding dir: %q, %v", dir, err)
+	}
+
+	outputPath := filepath.Join(dir, "output")
+	outputFile, err := createWriteableOutputFile(outputPath)
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatalf("error finding test_app: %v", err)
+	}
+
+	appArgs := []string{
+		"vdso-clock",
+		fmt.Sprintf("--file=%s", outputPath),
+		fmt.Sprintf("--count=%d", count),
+	}
+
+	spec := testutil.NewSpecWithArgs(append([]string{app}, appArgs...)...)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+
+	// Wait until application has started and written at least one pre-checkpoint reading.
+	if err := waitForFileLineCount(outputFile, 1); err != nil {
+		t.Fatalf("failed to wait for output file: %v", err)
+	}
+
+	// Checkpoint running container (first save).
+	dir1 := filepath.Join(dir, "ckpt1")
+	if err := os.MkdirAll(dir1, 0777); err != nil {
+		t.Fatalf("os.MkdirAll(dir1) failed: %v", err)
+	}
+	if err := cont.Checkpoint(conf, dir1, sandbox.CheckpointOpts{}); err != nil {
+		t.Fatalf("error checkpointing container (first save): %v", err)
+	}
+
+	preData1, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("error reading pre-checkpoint output: %v", err)
+	}
+	preReadings1 := parseClockReadings(t, preData1)
+	if len(preReadings1) == 0 {
+		t.Fatalf("expected at least one pre-checkpoint reading")
+	}
+	lastPreReading1 := preReadings1[len(preReadings1)-1]
+
+	// Adjust the snapshot metadata to simulate a snapshot from a host with a higher TSC.
+	if offsetCycles > 0 {
+		if err := adjustSnapshotMetadata(dir1, func(meta map[string]string) {
+			cycleStr, ok := meta["gvisor_tsc_snapshot_cycle"]
+			if !ok {
+				t.Fatalf("snapshot missing gvisor_tsc_snapshot_cycle metadata")
+			}
+			cycle, err := strconv.ParseUint(cycleStr, 10, 64)
+			if err != nil {
+				t.Fatalf("failed to parse gvisor_tsc_snapshot_cycle %q: %v", cycleStr, err)
+			}
+			meta["gvisor_tsc_snapshot_cycle"] = strconv.FormatUint(cycle+offsetCycles, 10)
+		}); err != nil {
+			t.Fatalf("failed to adjust snapshot metadata: %v", err)
+		}
+	}
+
+	// Restore into a second container (first restore).
+	args2 := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont2, err := New(conf, args2)
+	if err != nil {
+		t.Fatalf("error creating second container: %v", err)
+	}
+	defer cont2.Destroy()
+
+	if err := cont2.Restore(conf, dir1, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring second container: %v", err)
+	}
+
+	// Wait until the restored container has written at least one reading with the adjusted TSC.
+	if err := waitForFileLineCount(outputFile, len(preReadings1)+1); err != nil {
+		t.Fatalf("failed to wait for post-first-restore output: %v", err)
+	}
+
+	// Checkpoint the second container (second save) without manual metadata adjustment.
+	// Because cont2 is already running with an adjusted guest TSC, its saved snapshot
+	// metadata must record the guest TSC (including cont2's TSC offset) so that
+	// restoring into cont3 preserves the offset rather than resetting to the raw host TSC.
+	dir2 := filepath.Join(dir, "ckpt2")
+	if err := os.MkdirAll(dir2, 0777); err != nil {
+		t.Fatalf("os.MkdirAll(dir2) failed: %v", err)
+	}
+	if err := cont2.Checkpoint(conf, dir2, sandbox.CheckpointOpts{}); err != nil {
+		t.Fatalf("error checkpointing second container (second save): %v", err)
+	}
+
+	preData2, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("error reading pre-second-checkpoint output: %v", err)
+	}
+	preReadings2 := parseClockReadings(t, preData2)
+	if len(preReadings2) <= len(preReadings1) {
+		t.Fatalf("expected readings after first restore, got total=%d pre1=%d", len(preReadings2), len(preReadings1))
+	}
+	lastPreReading2 := preReadings2[len(preReadings2)-1]
+
+	// Restore into a third container (second restore).
+	args3 := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont3, err := New(conf, args3)
+	if err != nil {
+		t.Fatalf("error creating third container: %v", err)
+	}
+	defer cont3.Destroy()
+
+	if err := cont3.Restore(conf, dir2, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring third container: %v", err)
+	}
+
+	// Wait for third container to finish executing and verify exit status and output.
+	ws, err := cont3.Wait()
+	if err != nil {
+		t.Fatalf("Wait failed: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("error reading output: %v", err)
+	}
+	t.Logf("Container output:\n%s", string(data))
+
+	if ws.ExitStatus() != 0 {
+		t.Fatalf("Container failed with status %v: %s", ws, string(data))
+	}
+	if strings.Contains(string(data), "FAIL:") {
+		t.Fatalf("Failure detected in output: %s", string(data))
+	}
+
+	readings := parseClockReadings(t, data)
+	if len(readings) <= len(preReadings2) {
+		t.Fatalf("expected post-second-restore readings, got none (total %d, pre2 %d)", len(readings), len(preReadings2))
+	}
+	assertMonotonicReadings(t, readings)
+
+	if offsetCycles > 0 {
+		firstPostReading1 := readings[len(preReadings1)]
+		wantMinTSC1 := lastPreReading1.tsc + offsetCycles
+		if firstPostReading1.tsc < wantMinTSC1 {
+			t.Fatalf("RDTSC went backwards across first restore from host with higher TSC: pre+offset=%d, post=%d (delta=%d)",
+				wantMinTSC1, firstPostReading1.tsc, int64(firstPostReading1.tsc)-int64(wantMinTSC1))
+		}
+
+		firstPostReading2 := readings[len(preReadings2)]
+		if firstPostReading2.tsc < lastPreReading2.tsc {
+			t.Fatalf("RDTSC went backwards across second restore: pre2=%d, post2=%d (delta=%d)",
+				lastPreReading2.tsc, firstPostReading2.tsc, int64(firstPostReading2.tsc)-int64(lastPreReading2.tsc))
+		}
+	}
+}
+
+// TestCheckpointRestoreAdjustedTSC verifies that VDSO clock_gettime and syscall
+// clock_gettime remain synchronized and that time does not go backwards when
+// restoring a container snapshot with an adjusted TSC, including across chained
+// save/restore cycles.
+func TestCheckpointRestoreAdjustedTSC(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			if conf.Platform != "kvm" {
+				t.Skip("TSC adjustment is only supported on KVM")
+			}
+			const offsetCycles = 10_000_000_000 // ~4s
+			runAdjustedTSCTest(t, conf, 30 /* count */, offsetCycles)
+		})
+	}
 }

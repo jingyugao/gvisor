@@ -161,8 +161,8 @@ class Cgroup2Test : public ::testing::Test {
   }
 
   void TearDown() override {
-    if (root_) {
-      root_->Enter(getpid()).IgnoreError();
+    if (!original_cgroup_procs_.empty()) {
+      EXPECT_NO_ERRNO(RestoreOriginalCgroup());
     }
     if (c_) {
       CleanCgroupDirs(c_->Path());
@@ -173,6 +173,17 @@ class Cgroup2Test : public ::testing::Test {
     if (m_) return;
     m_.emplace(ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir()));
     root_.emplace(ASSERT_NO_ERRNO_AND_VALUE(m_->MountCgroup2fs()));
+
+    // Both this mount and /proc/self/cgroup are relative to our cgroup
+    // namespace. Its root may have controllers enabled and cannot accept
+    // processes, so cleanup must return to the original cgroup instead.
+    const auto memberships =
+        ASSERT_NO_ERRNO_AND_VALUE(ProcPIDCgroupEntries(getpid()));
+    const auto membership = memberships.find("");
+    ASSERT_NE(membership, memberships.end());
+    ASSERT_EQ(membership->second.hierarchy, 0);
+    original_cgroup_procs_ =
+        root_->Relpath(JoinPath(membership->second.path, "cgroup.procs"));
 
     auto controllers = root_->ReadControlFile("cgroup.controllers");
     if (controllers.ok()) {
@@ -195,6 +206,10 @@ class Cgroup2Test : public ::testing::Test {
   const Cgroup& root() {
     Init();
     return *root_;
+  }
+
+  PosixError RestoreOriginalCgroup() {
+    return SetContents(original_cgroup_procs_, absl::StrCat(getpid()));
   }
 
   // WaitForFrozen blocks until cg's cgroup.events reports "frozen <want>"
@@ -351,6 +366,7 @@ class Cgroup2Test : public ::testing::Test {
   std::optional<Mounter> m_;
   std::optional<Cgroup> root_;
   std::optional<Cgroup> c_;
+  std::string original_cgroup_procs_;
 };
 
 TEST(Cgroup2, SysFsCgroupAlreadyMounted) {
@@ -420,12 +436,12 @@ TEST_F(Cgroup2Test, DestroyConstraints) {
   EXPECT_THAT(parent.Delete(), PosixErrorIs(EBUSY));
 
   // Cannot destroy a cgroup node with a live attached process.
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(child.Enter(getpid()));
   EXPECT_THAT(child.Delete(), PosixErrorIs(EBUSY));
 
   // Destroy successfully once leaf node is empty.
-  ASSERT_NO_ERRNO(root().Enter(getpid()));
+  ASSERT_NO_ERRNO(RestoreOriginalCgroup());
   clean.Release();
   EXPECT_NO_ERRNO(child.Delete());
   EXPECT_NO_ERRNO(parent.Delete());
@@ -776,6 +792,38 @@ TEST_F(Cgroup2Test, SubtreeControlPids) {
   EXPECT_THAT(Exists(child.Relpath("pids.max")), IsPosixErrorOkAndHolds(false));
   EXPECT_THAT(child.ReadControlFile("cgroup.controllers"),
               IsPosixErrorOkAndHolds(Not(HasSubstr("pids"))));
+}
+
+TEST_F(Cgroup2Test, CpusetRejectsImpossibleCpu) {
+  const std::string controllers =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cgroup.controllers"));
+  SKIP_IF(!absl::StrContains(controllers, "cpuset"));
+
+  const std::string possible =
+      std::string(absl::StripAsciiWhitespace(ASSERT_NO_ERRNO_AND_VALUE(
+          GetContents("/sys/devices/system/cpu/possible"))));
+  // CPU IDs can be sparse or offline. Use the last possible ID, not the number
+  // of online CPUs, to choose a bit outside the system's possible mask.
+  const size_t last = possible.find_last_of(",-");
+  const uint32_t max_cpu = ASSERT_NO_ERRNO_AND_VALUE(Atoi<uint32_t>(
+      possible.substr(last == std::string::npos ? 0 : last + 1)));
+  // Keep the range small even if a regression accepts it.
+  SKIP_IF(max_cpu >= 4096);
+  const std::string impossible = absl::StrCat(max_cpu + 1);
+  const std::string before =
+      ASSERT_NO_ERRNO_AND_VALUE(c().ReadControlFile("cpuset.cpus"));
+  ASSERT_NO_ERRNO(c().WriteControlFile("cpuset.cpus", before));
+  RecordProperty("possible_cpus", possible);
+  for (const auto& [name, value] :
+       {std::pair{"singleton", impossible},
+        std::pair{"range", absl::StrCat("0-", impossible)}}) {
+    SCOPED_TRACE(value);
+    const PosixError error = c().WriteControlFile("cpuset.cpus", value);
+    RecordProperty(absl::StrCat(name, "_errno"), error.errno_value());
+    EXPECT_FALSE(error.ok()) << "Accepted an impossible CPU";
+    EXPECT_THAT(c().ReadControlFile("cpuset.cpus"),
+                IsPosixErrorOkAndHolds(before));
+  }
 }
 
 TEST_F(Cgroup2Test, PidsEnforcement) {
@@ -1161,7 +1209,7 @@ TEST_F(Cgroup2Test, NoInternalProcesses) {
   // as long as no controllers are enabled in its subtree_control.
   ASSERT_THAT(parent.ReadControlFile("cgroup.subtree_control"),
               IsPosixErrorOkAndHolds(Eq("")));
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(parent.Enter(getpid()));
 
   // Attempting to subsequently enable any resource controllers while
@@ -1184,13 +1232,26 @@ TEST_F(Cgroup2Test, AttachNonExistentProc) {
   constexpr pid_t kNonExistentPid = 99999999;
   EXPECT_THAT(c().WriteIntegerControlFile("cgroup.procs", kNonExistentPid),
               PosixErrorIs(ESRCH));
+
+  Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("child"));
+  const int64_t pid = getpid();
+  // An out-of-range PID must not select the calling process after narrowing.
+  for (int64_t invalid : {int64_t{INT_MAX} + 1, (int64_t{1} << 32) + pid,
+                          pid - (int64_t{1} << 32)}) {
+    SCOPED_TRACE(invalid);
+    ASSERT_NO_ERRNO(c().WriteIntegerControlFile("cgroup.procs", 0));
+    EXPECT_THAT(child.WriteIntegerControlFile("cgroup.procs", invalid),
+                PosixErrorIs(EINVAL));
+    EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(c().Procs()).contains(getpid()));
+    EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(child.Procs()).empty());
+  }
 }
 
 TEST_F(Cgroup2Test, PIDZeroMovesSelf) {
   Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("child"));
   ExpectDefaultControlFiles(child);
 
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(child.WriteIntegerControlFile("cgroup.procs", 0));
 
   auto procs = ASSERT_NO_ERRNO_AND_VALUE(child.Procs());
@@ -1207,7 +1268,7 @@ TEST_F(Cgroup2Test, TaskMigration) {
   Cgroup dst = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("dst"));
   ExpectDefaultControlFiles(dst);
 
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(src.Enter(getpid()));
   EXPECT_THAT(src.ReadControlFile("cgroup.events"),
               IsPosixErrorOkAndHolds(HasSubstr("populated 1")));
@@ -1568,7 +1629,7 @@ TEST_F(Cgroup2Test, CgroupDotEventsPerFDPollReadiness) {
   ExpectPollEvent(event_fd2);
 
   // Enter the cgroup.
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(child.Enter(getpid()));
   EXPECT_THAT(child.ReadControlFile("cgroup.events"),
               IsPosixErrorOkAndHolds(HasSubstr("populated 1")));
@@ -1655,7 +1716,7 @@ TEST_F(Cgroup2Test, PermChecksUseOpenTimeCreds) {
   Cgroup parent = ASSERT_NO_ERRNO_AND_VALUE(c().CreateChild("parent"));
   Cgroup child = ASSERT_NO_ERRNO_AND_VALUE(parent.CreateChild("child"));
 
-  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(root().Enter(getpid())); });
+  auto clean = Cleanup([&] { ASSERT_NO_ERRNO(RestoreOriginalCgroup()); });
   ASSERT_NO_ERRNO(parent.Enter(getpid()));
 
   // Grant unprivileged user read/write permissions to cgroup.procs.

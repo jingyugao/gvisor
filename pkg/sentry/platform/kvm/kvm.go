@@ -19,7 +19,6 @@ import (
 	"fmt"
 
 	"golang.org/x/sys/unix"
-
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -224,6 +223,11 @@ func (k *KVM) NewContext(pkgcontext.Context) platform.Context {
 // TSCOffset implements platform.TSCAdjustablePlatform.
 func (k *KVM) TSCOffset() uint64 {
 	return k.machine.tscOffset
+}
+
+// TSCFrequency implements platform.TSCAdjustablePlatform.
+func (k *KVM) TSCFrequency() (uint64, bool) {
+	return k.machine.tscFrequency, k.machine.tscFrequency != 0
 }
 
 type constructor struct{}

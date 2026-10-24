@@ -588,10 +588,6 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
-	if !deferCheckpoint && !s.FSRestore && HasFSCheckpointManifest(imagePath) {
-		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
-	}
-
 	opt := sentryapi.RestoreOpts{
 		Background:      background,
 		SplitFSRestore:  s.FSRestore,
@@ -605,16 +601,6 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	if !deferCheckpoint {
 		if err := s.setRestoreOpts(conf, imagePath, direct, &opt); err != nil {
 			return err
-		}
-
-		// If the platform needs a device FD we must pass it in when binding
-		// the checkpoint, after the checkpoint files in the payload.
-		if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
-			return err
-		} else if deviceFile != nil {
-			defer deviceFile.Close()
-			opt.HaveDeviceFile = true
-			opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
 		}
 	}
 
@@ -660,17 +646,35 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	return nil
 }
 
+// setRestoreOpts opens checkpoint files and the optional platform device.
+// The caller must close files added to opt, including when an error is returned.
 func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, direct bool, opt *sentryapi.RestoreOpts) error {
+	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
+		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
+	}
+
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-checkpoint-reads")
 	if err != nil {
 		return err
 	}
 	if clientSockFile == nil {
-		return s.setRestoreOptsForLocalCheckpointFiles(conf, imagePath, direct, opt)
+		if err := s.setRestoreOptsForLocalCheckpointFiles(conf, imagePath, direct, opt); err != nil {
+			return err
+		}
+	} else {
+		log.Infof("Restoring from GCS via checkpoint gofer")
+		opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
+		opt.UseCheckpointGofer = true
 	}
-	log.Infof("Restoring from GCS via checkpoint gofer")
-	opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
-	opt.UseCheckpointGofer = true
+
+	// The platform device must follow the checkpoint files in the payload.
+	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
+		return err
+	} else if deviceFile != nil {
+		defer deviceFile.Close()
+		opt.HaveDeviceFile = true
+		opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+	}
 	return nil
 }
 
@@ -802,10 +806,6 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 		if s.FSRestore {
 			return fmt.Errorf("deferred checkpoint restore does not support split filesystem restore")
 		}
-		if HasFSCheckpointManifest(imagePath) {
-			return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
-		}
-
 		checkpoint := sentryapi.RestoreOpts{Background: background}
 		defer func() {
 			for _, f := range checkpoint.FilePayload.Files {
@@ -814,13 +814,6 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 		}()
 		if err := s.setRestoreOpts(conf, imagePath, direct, &checkpoint); err != nil {
 			return err
-		}
-		if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
-			return err
-		} else if deviceFile != nil {
-			defer deviceFile.Close()
-			checkpoint.HaveDeviceFile = true
-			checkpoint.FilePayload.Files = append(checkpoint.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
 		}
 		checkpointArgs := checkpoint
 		checkpointArgs.FilePayload.Files = nil

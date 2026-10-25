@@ -1371,6 +1371,10 @@ type AsyncPagesFileLoad struct {
 	// qavail is unused capacity in ar.
 	qavail int
 
+	// foregroundSlots keeps up to two reader slots free of speculative reads.
+	// At least one slot remains unreserved for background progress. Immutable.
+	foregroundSlots int
+
 	// The async page loader combines multiple loads with contiguous pages file
 	// offsets (the common case) into a single read, even if their
 	// corresponding memmap.FileRanges and mappings are discontiguous. If curOp
@@ -1526,6 +1530,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		maxReadBytes:     maxReadBytes,
 		throttled:        atomicbitops.FromBool(opts.Throttled),
 		qavail:           maxParallel,
+		foregroundSlots:  min(2, maxParallel-1),
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
 	}
@@ -1546,7 +1551,8 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	return apfl, nil
 }
 
-// Unthrottle allows apfl to read pages without waiters at full parallelism.
+// Unthrottle removes the single-read limit for pages without waiters.
+// The foreground slot reserve still applies.
 // It is idempotent.
 func (apfl *AsyncPagesFileLoad) Unthrottle() {
 	if apfl.throttled.Swap(false) {
@@ -1655,6 +1661,10 @@ func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
 	return apfl.qavail > 0
 }
 
+func (apfl *AsyncPagesFileLoad) canEnqueueBackground() bool {
+	return apfl.qavail > apfl.foregroundSlots
+}
+
 // Preconditions: apfl.canEnqueue() == true.
 func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	if apfl.qavail <= 0 {
@@ -1688,6 +1698,9 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 // - fr must be page-aligned.
 func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
 	for {
+		if tempRef && !apfl.canEnqueueBackground() {
+			return 0
+		}
 		if apfl.curOp == nil {
 			id, err := apfl.opsBusy.FirstZero(0)
 			if err != nil {
@@ -1946,9 +1959,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 			}
 		}
 		apfl.mu.Unlock()
-		// Fill remaining queue with reads for pages with no waiters.
+		// Read pages without waiters while preserving foreground capacity.
 		throttled := apfl.throttled.Load()
-		if apfl.canEnqueue() && (!throttled || (apfl.qavail == maxParallel && apfl.curOp == nil)) {
+		if apfl.canEnqueueBackground() && (!throttled || (apfl.qavail == maxParallel && apfl.curOp == nil)) {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -1994,7 +2007,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					ulseg.ValuePtr().started = true
 					amfl.minUnstarted = ulFR.End
 					amfl.f.incRefLocked(ulFR)
-					if (throttled && partial) || !apfl.canEnqueue() {
+					if (throttled && partial) || !apfl.canEnqueueBackground() {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()
 						break amflsLoop

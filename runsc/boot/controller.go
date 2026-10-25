@@ -466,7 +466,10 @@ func (r *restorer) initCheckpoint(o *sentryapi.RestoreOpts, noRoot bool) error {
 		// This immediately starts loading the main MemoryFile asynchronously.
 		// For background restore, throttle page loading until the kernel is
 		// restored, so that restore does not wait behind page reads.
-		r.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, r.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
+		r.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, r.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{
+			Throttled:       o.Background,
+			ForegroundSlots: r.cm.l.root.conf.RestoreForegroundSlots,
+		}) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")

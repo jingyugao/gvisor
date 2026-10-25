@@ -365,7 +365,7 @@ func makeFSRestoreOptsForCheckpointGofer(args *Args) (fsRestoreOpts, error) {
 }
 
 // startFSRestore takes ownership of resources in optsList.
-func startFSRestore(optsList []fsRestoreOpts) (*fsRestore, error) {
+func startFSRestore(optsList []fsRestoreOpts, pageLoadOpts pgalloc.AsyncPagesFileLoadOpts) (*fsRestore, error) {
 	fsr := &fsRestore{
 		mfs:       make(map[checkpoint.ResourceID]*fscheckpoint.MemoryFile),
 		tmpfs:     make(map[checkpoint.ResourceID]*fscheckpoint.Tmpfs),
@@ -497,7 +497,7 @@ func startFSRestore(optsList []fsRestoreOpts) (*fsRestore, error) {
 				} else if log.IsLogging(log.Debug) {
 					log.Debugf("Finished loading filesystem checkpoint pages")
 				}
-			}, nil, pgalloc.AsyncPagesFileLoadOpts{})
+			}, nil, pageLoadOpts)
 			opts.PagesFile = nil
 			if err != nil {
 				return fmt.Errorf("failed to start async page loading: %w", err)

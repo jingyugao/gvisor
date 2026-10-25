@@ -713,7 +713,7 @@ func New(args Args) (*Loader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to set up filesystem checkpoint restore: %w", err)
 		}
-		fsr, err := startFSRestore(fsrOpts)
+		fsr, err := startFSRestore(fsrOpts, pgalloc.AsyncPagesFileLoadOpts{ForegroundSlots: args.Conf.RestoreForegroundSlots})
 		if err != nil {
 			return nil, fmt.Errorf("failed to start filesystem checkpoint restore: %w", err)
 		}

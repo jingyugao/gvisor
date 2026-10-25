@@ -464,7 +464,7 @@ func (mfl *AsyncMFLoader) KickoffPrivate(ctx context.Context, mfmap map[checkpoi
 	}
 }
 
-// Unthrottle allows page loading to use full I/O parallelism.
+// Unthrottle removes the single-read limit on background page loading.
 func (mfl *AsyncMFLoader) Unthrottle() {
 	mfl.mainMFStartWg.Wait()
 	if mfl.apfl != nil {

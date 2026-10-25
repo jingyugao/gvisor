@@ -452,6 +452,10 @@ type Config struct {
 	// performed during restore.
 	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
 
+	// RestoreForegroundSlots reserves asynchronous checkpoint reader slots for
+	// pages with waiters. At least one slot remains available for background reads.
+	RestoreForegroundSlots int `flag:"restore-foreground-slots"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 
@@ -561,6 +565,9 @@ func (c *Config) PlatformDeviceFor(platform string) string {
 // Config.Override does not validate, so callers must call Validate once they
 // are done overriding.
 func (c *Config) Validate() error {
+	if c.RestoreForegroundSlots < 0 {
+		return fmt.Errorf("restore-foreground-slots must be >= 0, got: %d", c.RestoreForegroundSlots)
+	}
 	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
 	if err != nil {
 		return err

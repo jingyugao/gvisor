@@ -1371,7 +1371,7 @@ type AsyncPagesFileLoad struct {
 	// qavail is unused capacity in ar.
 	qavail int
 
-	// foregroundSlots keeps up to two reader slots free of speculative reads.
+	// foregroundSlots keeps reader slots free of speculative reads.
 	// At least one slot remains unreserved for background progress. Immutable.
 	foregroundSlots int
 
@@ -1510,11 +1510,20 @@ type AsyncPagesFileLoadOpts struct {
 	// If Throttled is true, reads of pages without waiters are throttled
 	// until AsyncPagesFileLoad.Unthrottle() is called.
 	Throttled bool
+
+	// ForegroundSlots is the number of reader slots reserved for pages with
+	// waiters. It must be non-negative and is capped to leave at least one slot
+	// for background reads. Zero disables reservation.
+	ForegroundSlots int
 }
 
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
 // file ar. It takes ownership of ar, even if it returns a non-nil error.
 func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline, opts AsyncPagesFileLoadOpts) (*AsyncPagesFileLoad, error) {
+	if opts.ForegroundSlots < 0 {
+		ar.Close()
+		return nil, fmt.Errorf("foreground reader slots must be non-negative, got: %d", opts.ForegroundSlots)
+	}
 	maxReadBytes := hostarch.PageRoundDown(ar.MaxReadBytes())
 	if maxReadBytes <= 0 {
 		ar.Close()
@@ -1530,7 +1539,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		maxReadBytes:     maxReadBytes,
 		throttled:        atomicbitops.FromBool(opts.Throttled),
 		qavail:           maxParallel,
-		foregroundSlots:  min(2, maxParallel-1),
+		foregroundSlots:  min(opts.ForegroundSlots, maxParallel-1),
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
 	}
@@ -1547,6 +1556,7 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	}
 	apfl.lfStatus.Init()
 	apfl.priorityWake = make(chan struct{}, 1)
+	log.Debugf("Async page loading: reader slots=%d, foreground reservation=%d, throttled=%t", maxParallel, apfl.foregroundSlots, opts.Throttled)
 	go apfl.main()
 	return apfl, nil
 }

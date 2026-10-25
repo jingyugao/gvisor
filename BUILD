@@ -279,7 +279,7 @@ toolchain(
 #
 # Packages listed in GAZELLE_PACKAGES must match gazelle's output; presubmit
 # runs //:gazelle_check to enforce this. To fix them, run:
-#   bazel run //:gazelle_fix
+#   make gazelle-fix
 #
 # gazelle:prefix gvisor.dev/gvisor
 # gazelle:go_naming_convention import
@@ -321,3 +321,8 @@ exports_files([
     "go.sum",
     "go.mod",
 ])
+
+exports_files(
+    [".clang-format"],
+    visibility = ["//tools:__pkg__"],
+)

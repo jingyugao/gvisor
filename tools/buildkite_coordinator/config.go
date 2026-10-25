@@ -59,6 +59,14 @@ type config struct {
 	// agentServiceAccount is the email of the service account that agent VMs
 	// must run as.
 	agentServiceAccount string
+
+	// rateLimitCollection is the name of the Firestore collection used to store
+	// per-author job accounting for rate-limiting purposes.
+	rateLimitCollection string
+
+	// artifactBucket is the bucket that agents upload artifacts to. Used to grant
+	// scoped access tokens to agents.
+	artifactBucket string
 }
 
 // loadConfig reads the configuration from the environment and the metadata
@@ -102,6 +110,8 @@ func loadConfig(ctx context.Context) (config, error) {
 		githubTokenSecret:   envOr("GITHUB_TOKEN_SECRET", "github-default-token"),
 		project:             projectID,
 		agentServiceAccount: agentServiceAccount,
+		rateLimitCollection: envOr("RATE_LIMIT_COLLECTION", "perAuthorJobAccounting"),
+		artifactBucket:      envOr("ARTIFACT_BUCKET", "gvisor-buildkite"),
 	}, nil
 }
 

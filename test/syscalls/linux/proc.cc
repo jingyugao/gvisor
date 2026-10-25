@@ -53,7 +53,6 @@
 #include <ostream>
 #include <regex>  // NOLINT
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -77,7 +76,6 @@
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
 #include "test/util/epoll_util.h"
 #include "test/util/eventfd_util.h"
@@ -102,7 +100,6 @@
 // way to get it tested on both gVisor, PTrace and Linux.
 
 using ::testing::AllOf;
-using ::testing::AnyOf;
 using ::testing::ContainerEq;
 using ::testing::Contains;
 using ::testing::ContainsRegex;
@@ -1032,7 +1029,7 @@ TEST(ProcSelfMaps, Basic) {
   std::vector<std::string> stacks;
   // Make sure there's a stack in there.
   for (const auto& str : strings) {
-    if (str.find("[stack]") != std::string::npos) {
+    if (absl::StrContains(str, "[stack]")) {
       stacks.push_back(str);
     }
   }
@@ -1684,15 +1681,20 @@ TEST(ProcLoadavg, Fields) {
   EXPECT_EQ(fields.size(), 6) << proc_loadvg;
 
   double val;
-  uint64_t val2;
   // First three fields are floating point numbers.
   EXPECT_TRUE(absl::SimpleAtod(fields[0], &val)) << proc_loadvg;
   EXPECT_TRUE(absl::SimpleAtod(fields[1], &val)) << proc_loadvg;
   EXPECT_TRUE(absl::SimpleAtod(fields[2], &val)) << proc_loadvg;
   // Rest of the fields are valid base 10 numbers.
-  EXPECT_TRUE(absl::SimpleAtoi(fields[3], &val2)) << proc_loadvg;
-  EXPECT_TRUE(absl::SimpleAtoi(fields[4], &val2)) << proc_loadvg;
-  EXPECT_TRUE(absl::SimpleAtoi(fields[5], &val2)) << proc_loadvg;
+  uint64_t running_tasks = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[3], &running_tasks)) << proc_loadvg;
+  EXPECT_GE(running_tasks, 1) << proc_loadvg;
+  uint64_t total_tasks = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[4], &total_tasks)) << proc_loadvg;
+  EXPECT_GE(total_tasks, running_tasks) << proc_loadvg;
+  uint64_t last_tid = 0;
+  EXPECT_TRUE(absl::SimpleAtoi(fields[5], &last_tid)) << proc_loadvg;
+  EXPECT_GE(last_tid, 1) << proc_loadvg;
 }
 
 // NOTE: Tests in priority.cc also check certain priority related fields in
@@ -2023,6 +2025,24 @@ TEST(ProcPidStatusTest, HasBasicFields) {
             Pair("Groups", StartsWith(absl::StrJoin(supplementary_gids, " "))),
         }));
   });
+}
+
+TEST(ProcPidStatusTest, InvalidCloseDoesNotGrowFDTable) {
+  // Restoring a checkpoint may change the FD table's capacity.
+  const DisableSave disable_save;
+  const std::string before_str =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/status"));
+  const auto before = ASSERT_NO_ERRNO_AND_VALUE(ParseProcStatus(before_str));
+  const auto fd_size = before.find("FDSize");
+  ASSERT_NE(fd_size, before.end());
+
+  EXPECT_THAT(close(INT_MAX), SyscallFailsWithErrno(EBADF));
+
+  const std::string after_str =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/status"));
+  EXPECT_THAT(
+      ParseProcStatus(after_str),
+      IsPosixErrorOkAndHolds(Contains(Pair("FDSize", fd_size->second))));
 }
 
 TEST(ProcPidStatusTest, NoNewPrivs) {
@@ -2726,6 +2746,24 @@ std::vector<std::string> TaskFiles(const std::vector<pid_t>& pids) {
 TEST(ProcTask, Basic) {
   EXPECT_NO_ERRNO(
       DirContains("/proc/self/task", {".", "..", absl::StrCat(getpid())}, {}));
+}
+
+TEST(ProcTask, InvalidTaskNames) {
+  const std::string invalid_names[] = {
+      absl::StrCat("0", getpid()),
+      absl::StrCat((uint64_t{1} << 32) + getpid()),
+      "2147483648",
+      "4294967295",
+      "18446744073709551616",
+  };
+  for (const std::string& name : invalid_names) {
+    for (const char* dir : {"/proc/", "/proc/self/task/"}) {
+      const std::string path = absl::StrCat(dir, name);
+      SCOPED_TRACE(path);
+      struct stat st;
+      EXPECT_THAT(stat(path.c_str(), &st), SyscallFailsWithErrno(ENOENT));
+    }
+  }
 }
 
 // Helper class for creating a new task in the current thread group.
@@ -4129,6 +4167,7 @@ TEST(ProcSysFsFileNr, TracksOpenFiles) {
   EXPECT_EQ(before[1], 0);
 
   std::vector<FileDescriptor> fds;
+  fds.reserve(kNumFiles);
   for (int i = 0; i < kNumFiles; i++) {
     fds.push_back(ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/null", O_RDONLY)));
   }

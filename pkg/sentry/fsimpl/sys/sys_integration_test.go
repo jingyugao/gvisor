@@ -23,7 +23,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
@@ -230,7 +229,7 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 	if err := os.MkdirAll(pciPath0, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
-	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0000:10")
+	pciPath1 := path.Join(sysfsTestDir, "sys", "devices", "pci0007:10")
 	if err := os.MkdirAll(pciPath1, 0755); err != nil {
 		t.Fatalf("Failed to create PCI directory: %v", err)
 	}
@@ -261,14 +260,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		{
 			group:             "2",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0",
+			pciAddress:        "0007:10:05.0",
 			name:              "vfio2",
 			nestedDeviceIndex: 3,
 		},
 		{
 			group:             "3",
 			pciPath:           pciPath1,
-			pciAddress:        "0000:10:05.0/0000:03:00.1",
+			pciAddress:        "0007:10:05.0/0007:03:00.1",
 			name:              "vfio3",
 			nestedDeviceIndex: -1,
 		},
@@ -297,6 +296,14 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 		if err := os.Symlink(path.Join("..", "..", "..", "kernel", "iommu_groups", device.group), path.Join(device.pciPath, device.pciAddress, "iommu_group")); err != nil {
 			t.Fatalf("Failed to symlink iommu_groups directory: %v", err)
 		}
+	}
+	// Non-PCI platform devices in IOMMU groups (e.g. on ARM64 hosts) must be ignored.
+	nonPCIIOMMUPath := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", "4", "devices")
+	if err := os.MkdirAll(nonPCIIOMMUPath, 0755); err != nil {
+		t.Fatalf("Failed to create non-PCI iommu_groups directory: %v", err)
+	}
+	if err := os.Symlink("../../../../devices/platform/arm-smmu-v3.0.auto", path.Join(nonPCIIOMMUPath, "arm-smmu-v3.0.auto")); err != nil {
+		t.Fatalf("Failed to symlink non-PCI iommu_group device: %v", err)
 	}
 	s := newTestSystem(t, sysfsTestDir)
 	defer s.Destroy()
@@ -403,6 +410,58 @@ func TestEnableTPUProxyPathsV5(t *testing.T) {
 			tc.pciAddr: linux.DT_LNK,
 		})
 	}
+}
+
+// Check that the DMI entries exist after mount and after CompleteRestore
+// rebuilds /sys/class and /sys/devices.
+func TestProductNameCompleteRestore(t *testing.T) {
+	sysfsTestDir := t.TempDir()
+	for _, dir := range []string{
+		path.Join(sysfsTestDir, "sys", "devices"),
+		path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("Failed to create %q: %v", dir, err)
+		}
+	}
+	const productName = "Test Product"
+	s := newTestSystemWithInternalData(t, &sys.InternalData{
+		ProductName:         productName,
+		EnableTPUProxyPaths: true,
+		TestSysfsPathPrefix: sysfsTestDir,
+	})
+	defer s.Destroy()
+
+	checkDMI := func(stage string) {
+		t.Helper()
+		pop := s.PathOpAtRoot("devices/virtual/dmi/id/product_name")
+		fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, pop, &vfs.OpenOptions{})
+		if err != nil {
+			t.Fatalf("%s: OpenAt(product_name) failed: %v", stage, err)
+		}
+		defer fd.DecRef(s.Ctx)
+		content, err := s.ReadToEnd(fd)
+		if err != nil {
+			t.Fatalf("%s: Read(product_name) failed: %v", stage, err)
+		}
+		if want := productName + "\n"; content != want {
+			t.Errorf("%s: product_name = %q, want %q", stage, content, want)
+		}
+		pop = s.PathOpAtRoot("class/dmi/id")
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, pop)
+		if err != nil {
+			t.Fatalf("%s: ReadlinkAt(class/dmi/id) failed: %v", stage, err)
+		}
+		if want := "../../devices/virtual/dmi/id"; got != want {
+			t.Errorf("%s: ReadlinkAt(class/dmi/id) = %q, want %q", stage, got, want)
+		}
+	}
+
+	checkDMI("before CompleteRestore")
+	if err := s.VFS.CompleteRestore(s.Ctx, &vfs.CompleteRestoreOptions{}); err != nil {
+		t.Fatalf("CompleteRestore failed: %v", err)
+	}
+	checkDMI("after CompleteRestore")
 }
 
 // rdmaTestPCIConfig is a fake raw PCI config space blob; deliberately not

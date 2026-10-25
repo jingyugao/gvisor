@@ -50,6 +50,11 @@ import (
 //     if it is no longer needed at all.
 //  2. Add the flag to flags_graveyard.go and remove it from flags.go.
 type Config struct {
+	// DeferCheckpoint is set by the restore subcommand for the current request.
+	// It is passed to the Sentry through RestoreOpts, not through boot flags or
+	// serialized Config values.
+	DeferCheckpoint bool `json:"-"`
+
 	// RootDir is the runtime root directory.
 	RootDir string `flag:"root"`
 
@@ -556,8 +561,13 @@ func (c *Config) PlatformDeviceFor(platform string) string {
 // Config.Override does not validate, so callers must call Validate once they
 // are done overriding.
 func (c *Config) Validate() error {
-	if _, err := parsePlatformDevicePaths(c.PlatformDevicePath); err != nil {
+	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
+	if err != nil {
 		return err
+	}
+	if c.Platform == PlatformAuto && paths.any != "" {
+		// A single path cannot apply to every platform that auto may choose.
+		return fmt.Errorf("--platform=%s accepts only --platform_device_path={platform}={path}[,{platform}={path}...], got %q", PlatformAuto, c.PlatformDevicePath)
 	}
 	if c.Overlay && c.Overlay2.Enabled() {
 		// Deprecated flag was used together with flag that replaced it.

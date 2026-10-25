@@ -35,7 +35,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-spec/specs-go/features"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -184,6 +183,11 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config, noRootContainer bool) e
 	if spec.Linux != nil && spec.Linux.RootfsPropagation != "" {
 		if err := validateRootfsPropagation(spec.Linux.RootfsPropagation); err != nil {
 			return err
+		}
+	}
+	if IsRootContainer(spec) {
+		if utsns, ok := GetNS(specs.UTSNamespace, spec); ok && utsns.Path != "" {
+			return fmt.Errorf("joining UTS namespace %q is not supported", utsns.Path)
 		}
 	}
 	for _, m := range spec.Mounts {

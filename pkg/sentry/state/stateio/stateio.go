@@ -131,9 +131,9 @@ type InterruptibleAsyncReader interface {
 	AsyncReader
 
 	// WaitInterruptible is like Wait, but receiving from wake allows fewer
-	// than minCompletions to be returned. The bool reports an interruption.
+	// than minCompletions to be returned.
 	// A nil wake channel gives the same behavior as Wait.
-	WaitInterruptible(cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, bool, error)
+	WaitInterruptible(cs []Completion, minCompletions int, wake <-chan struct{}) ([]Completion, error)
 }
 
 // AsyncWriter represents a file supporting asynchronous sequential writes.

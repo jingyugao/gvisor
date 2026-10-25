@@ -1631,6 +1631,10 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 			apfl.bytesWaited += ullen
 			if !ul.started {
 				apfl.priority.PushBack(aplFileRange{amfl, ulFR})
+				select {
+				case apfl.priorityWake <- struct{}{}:
+				default:
+				}
 			}
 			if logAwaitedLoads {
 				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
@@ -1648,10 +1652,6 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		}
 		apfl.numWaiters++
 		apfl.totalWaiters++
-		select {
-		case apfl.priorityWake <- struct{}{}:
-		default:
-		}
 	}
 	apfl.mu.Unlock()
 	if pending {
@@ -2060,7 +2060,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// A new demand can use spare capacity without waiting for an
 			// unrelated read to finish. Buffered notifications also cover the
 			// interval between checking priority and starting this wait.
-			completions, _, err = reader.WaitInterruptible(completions[:0], 1, apfl.priorityWake)
+			completions, err = reader.WaitInterruptible(completions[:0], 1, apfl.priorityWake)
 		} else {
 			completions, err = apfl.ar.Wait(completions[:0], 1 /* minCompletions */)
 		}

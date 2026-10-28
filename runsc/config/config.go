@@ -456,6 +456,12 @@ type Config struct {
 	// performed during restore.
 	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
 
+	// RestoreBackgroundSlots is the maximum number of background checkpoint
+	// page reads in flight during restore. A low value makes page faults
+	// after restore faster, but can make the load of all pages slower. Zero
+	// means no limit.
+	RestoreBackgroundSlots int `flag:"restore-background-slots"`
+
 	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
 	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
 

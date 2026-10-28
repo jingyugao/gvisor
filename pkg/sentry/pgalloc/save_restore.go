@@ -1375,6 +1375,13 @@ type AsyncPagesFileLoad struct {
 	// immutable.
 	maxReadBytes uint64
 
+	// backgroundSlots is the maximum number of background reads in flight,
+	// or zero for no limit beyond maxParallel. It is immutable.
+	backgroundSlots int
+
+	// backgroundInflight is the number of background reads in flight.
+	backgroundInflight int
+
 	// qavail is unused capacity in ar.
 	qavail int
 
@@ -1481,6 +1488,15 @@ var aplWaiterPool = sync.Pool{
 	},
 }
 
+// aplLoadKind records whether a read was queued for waiting callers or as
+// background prefetch.
+type aplLoadKind uint8
+
+const (
+	aplForegroundLoad aplLoadKind = iota
+	aplBackgroundLoad
+)
+
 // aplOp tracks async page load state corresponding to a single AIO read
 // operation.
 type aplOp struct {
@@ -1499,9 +1515,10 @@ type aplOp struct {
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
 
-	// If tempRef is true, a temporary reference is held on pages in frs that
-	// should be dropped after completion.
-	tempRef bool
+	// kind records how the operation was queued. Background operations hold
+	// temporary references on pages in frs until completion, even if callers
+	// start waiting for those pages while the read is in flight.
+	kind aplLoadKind
 }
 
 func (op *aplOp) off() int64 {
@@ -1513,6 +1530,12 @@ type AsyncPagesFileLoadOpts struct {
 	// If Throttled is true, reads of pages without waiters are throttled
 	// until AsyncPagesFileLoad.Unthrottle() is called.
 	Throttled bool
+
+	// BackgroundSlots is the maximum number of reads of pages without waiters
+	// in flight. These reads queue ahead of awaited reads at the storage
+	// device, so a lower limit decreases the latency of awaited reads but can
+	// increase the total load time. Zero means no limit.
+	BackgroundSlots int
 }
 
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
@@ -1536,6 +1559,10 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
 	}
+	if n := opts.BackgroundSlots; n > 0 && n < maxParallel {
+		apfl.backgroundSlots = n
+	}
+	log.Infof("Async page loading: reader slots=%d, background slots=%d (0 is no limit), throttled=%t", maxParallel, apfl.backgroundSlots, opts.Throttled)
 	// Mark ops in opsBusy that don't actually exist as permanently busy.
 	for i, n := maxParallel, apfl.opsBusy.Size(); i < n; i++ {
 		apfl.opsBusy.Add(uint32(i))
@@ -1653,11 +1680,18 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	return apfl.err()
 }
 
-func (apfl *AsyncPagesFileLoad) canEnqueue() bool {
-	return apfl.qavail > 0
+func (apfl *AsyncPagesFileLoad) canEnqueue(kind aplLoadKind) bool {
+	switch kind {
+	case aplForegroundLoad:
+		return apfl.qavail > 0
+	case aplBackgroundLoad:
+		return apfl.qavail > 0 && (apfl.backgroundSlots == 0 || apfl.backgroundInflight < apfl.backgroundSlots)
+	default:
+		panic("invalid page load kind")
+	}
 }
 
-// Preconditions: apfl.canEnqueue() == true.
+// Preconditions: apfl.qavail > 0.
 func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	if apfl.qavail <= 0 {
 		panic("queue full")
@@ -1671,6 +1705,9 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	}
 
 	apfl.qavail--
+	if op.kind == aplBackgroundLoad {
+		apfl.backgroundInflight++
+	}
 	apfl.curOp = nil
 	if len(op.frs) == 1 && len(op.iovecs) == 1 {
 		// Perform a non-vectorized read to save an indirection (and possible
@@ -1679,18 +1716,24 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 	} else {
 		apfl.ar.AddReadv(int(apfl.curOpID), op.off(), op.total, op.amfl.df, op.frs, op.iovecs)
 	}
-	if logAwaitedLoads && !op.tempRef {
+	if logAwaitedLoads && op.kind == aplForegroundLoad {
 		log.Infof("MemoryFile(%p): awaited opid %d start, read %d bytes: %v", op.amfl.f, apfl.curOpID, op.total, op.frs)
 	}
 }
 
+// enqueueRange adds pages to an operation of the given kind. A new operation
+// requires an available reader slot; background operations must also stay
+// within the background slot limit.
+//
 // Preconditions:
-// - apfl.canEnqueue() == true.
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
+func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, kind aplLoadKind) uint64 {
 	for {
 		if apfl.curOp == nil {
+			if !apfl.canEnqueue(kind) {
+				return 0
+			}
 			id, err := apfl.opsBusy.FirstZero(0)
 			if err != nil {
 				panic(fmt.Sprintf("all ops busy with qavail=%d: %v", apfl.qavail, err))
@@ -1703,25 +1746,22 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			apfl.curOp = op
 			apfl.curOpID = id
 		}
-		n := apfl.combine(amfl, fr, off, tempRef)
+		n := apfl.combine(amfl, fr, off, kind)
 		if n > 0 {
 			return n
 		}
 		// Flush the existing (conflicting) op and try again with a new one.
 		apfl.enqueueCurOp()
-		if !apfl.canEnqueue() {
-			return 0
-		}
 	}
 }
 
-// combine adds as much of the given load as possible to g.curOp and returns
+// combine adds as much of the given load as possible to apfl.curOp and returns
 // the number of bytes added.
 //
 // Preconditions:
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
+func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, kind aplLoadKind) uint64 {
 	op := apfl.curOp
 	if op.total != 0 {
 		if op.end != off {
@@ -1737,11 +1777,9 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 			// FileRanges.
 			return 0
 		}
-		if op.tempRef != tempRef {
-			// Incompatible reference-counting semantics. We could handle this
-			// by making tempRef per-FileRange, but it's very unlikely that an
-			// awaited load (tempRef=false) will happen to be followed by an
-			// unawaited load (tempRef=true) at the correct offset.
+		if op.kind != kind {
+			// Foreground and background loads have different page-reference
+			// ownership, so they must use separate operations.
 			return 0
 		}
 	}
@@ -1787,7 +1825,7 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 	}
 	op.end += n
 	op.total += n
-	op.tempRef = tempRef
+	op.kind = kind
 	if len(op.frs) > 0 && op.frs[len(op.frs)-1].End == fr.Start {
 		op.frs[len(op.frs)-1].End = fr.End
 	} else {
@@ -1901,12 +1939,12 @@ func (apfl *AsyncPagesFileLoad) main() {
 
 	for {
 		// Enqueue as many reads as possible.
-		if !apfl.canEnqueue() {
+		if apfl.qavail <= 0 {
 			panic("main loop invariant failed")
 		}
 		// Prioritize reading pages with waiters.
 		apfl.mu.Lock()
-		for apfl.canEnqueue() && !apfl.priority.Empty() {
+		for apfl.canEnqueue(aplForegroundLoad) && !apfl.priority.Empty() {
 			fr := apfl.priority.PopFront()
 			// All pages in apfl.priority have non-zero waiters and were split
 			// around fr by fr.amfl.awaitLoad(), and fr.amfl.unloaded never
@@ -1926,7 +1964,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// fr.amfl.awaitLoad() precondition), so they can't become
 				// waste (which would allow them to be racily released or
 				// recycled).
-				n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* tempRef */)
+				n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, aplForegroundLoad)
 				if n == 0 {
 					// Try again in the next iteration of the main loop, when
 					// we have space in the queue again.
@@ -1950,7 +1988,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
 		throttled := apfl.throttled.Load()
-		if apfl.canEnqueue() && (!throttled || (apfl.qavail == maxParallel && apfl.curOp == nil)) {
+		if apfl.canEnqueue(aplBackgroundLoad) && (!throttled || (apfl.qavail == maxParallel && apfl.curOp == nil)) {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -1981,9 +2019,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 					var n uint64
 					if throttled && apfl.curOp != nil {
 						// Only extend the single throttled read.
-						n = apfl.combine(amfl, ulFR, ul.off, true /* tempRef */)
+						n = apfl.combine(amfl, ulFR, ul.off, aplBackgroundLoad)
 					} else {
-						n = apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
+						n = apfl.enqueueRange(amfl, ulFR, ul.off, aplBackgroundLoad)
 					}
 					if n == 0 {
 						apfl.mu.Unlock()
@@ -1996,7 +2034,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					ulseg.ValuePtr().started = true
 					amfl.minUnstarted = ulFR.End
 					amfl.f.incRefLocked(ulFR)
-					if (throttled && partial) || !apfl.canEnqueue() {
+					if (throttled && partial) || !apfl.canEnqueue(aplBackgroundLoad) {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()
 						break amflsLoop
@@ -2051,7 +2089,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 			op := &apfl.ops[c.ID]
 			apfl.opsBusy.Remove(uint32(c.ID))
 			apfl.qavail++
-			if op.tempRef {
+			if op.kind == aplBackgroundLoad {
+				apfl.backgroundInflight--
 				// Delay f.DecRef(fr) until after dropping locks. This is
 				// required to avoid lock recursion via dropping the last
 				// reference => asyncMemoryFileLoad.cancelWasteLoad() =>

@@ -61,6 +61,9 @@ type Restore struct {
 
 	// backgroundLoad controls how pages are loaded if background is true.
 	backgroundLoad sandbox.BackgroundLoad
+
+	// deferCheckpoint prepares a no-root sandbox without binding a checkpoint.
+	deferCheckpoint bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -87,6 +90,7 @@ func (r *Restore) SetFlags(f *flag.FlagSet) {
 	f.Var(&r.directIO, "direct-io", "use O_DIRECT for reading checkpoint pages file. Values: auto|on|off (default auto). auto enables it for GPU restores if the filesystem supports it.")
 	f.BoolVar(&r.background, "background", true, "allow image loading to continue after restore exits (requires uncompressed checkpoint)")
 	f.Var(&r.backgroundLoad, "background-load", "how to load the image after restore exits. Values: eager|lazy (default eager). eager loads all pages as fast as possible. lazy loads pages only when the application faults on them or the next checkpoint needs them; the image must stay available until then. Requires --background.")
+	f.BoolVar(&r.deferCheckpoint, "defer-checkpoint", false, "prepare a no-root sandbox without checkpoint files and return immediately; image-path must be omitted")
 
 	// Unimplemented flags necessary for compatibility with docker.
 
@@ -141,7 +145,14 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	if bundleDir == "" {
 		bundleDir = getwdOrDie()
 	}
-	if r.imagePath == "" {
+	if r.deferCheckpoint {
+		if r.imagePath != "" {
+			return util.Errorf("image-path cannot be used with defer-checkpoint")
+		}
+		if len(r.fsRestoreImagePaths) != 0 {
+			return util.Errorf("fs-restore-image-path cannot be used with defer-checkpoint")
+		}
+	} else if r.imagePath == "" {
 		return util.Errorf("image-path flag must be provided")
 	}
 	if r.direct && r.directIO == sandbox.DirectIOAuto {
@@ -161,7 +172,7 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		ConsoleSocket:       r.consoleSocket,
 		PIDFile:             r.pidFile,
 		UserLog:             r.userLog,
-		Attached:            !r.detach,
+		Attached:            !r.detach && !r.deferCheckpoint,
 		FSRestoreImagePaths: []string(r.fsRestoreImagePaths),
 		FSRestoreDirect:     r.fsRestoreDirect || r.directIO == sandbox.DirectIOOn,
 		CheckpointDirPath:   r.imagePath,
@@ -173,6 +184,9 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	if err != nil {
 		if err != os.ErrNotExist {
 			return util.Errorf("loading container: %v", err)
+		}
+		if r.deferCheckpoint && !r.noRootContainer {
+			return util.Errorf("defer-checkpoint requires no-root-container when creating a sandbox")
 		}
 
 		log.Warningf("Container not found, creating new one, cid: %s, spec from: %s", id, bundleDir)
@@ -209,7 +223,7 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	}
 
 	log.Debugf("Restore: %v", r.imagePath)
-	err = c.Restore(conf, r.imagePath, r.directIO, r.background, r.backgroundLoad, nil /* networkArgs */)
+	err = c.Restore(conf, r.imagePath, r.directIO, r.background, r.backgroundLoad, r.deferCheckpoint, nil /* networkArgs */)
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
 	}

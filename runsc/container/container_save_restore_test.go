@@ -105,7 +105,7 @@ func TestSignalUnkillablePolicyRestore(t *testing.T) {
 				}
 				defer cont2.Destroy()
 
-				if err := cont2.Restore(&testConf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+				if err := cont2.Restore(&testConf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 					t.Fatalf("error restoring container: %v", err)
 				}
 
@@ -194,7 +194,7 @@ func TestSignalUnkillablePolicyRestore(t *testing.T) {
 				}
 				defer cont2.Destroy()
 
-				if err := cont2.Restore(&testConf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+				if err := cont2.Restore(&testConf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 					t.Fatalf("error restoring container: %v", err)
 				}
 
@@ -300,7 +300,7 @@ func testCheckpointRestore(t *testing.T, conf *config.Config, compression statef
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -351,7 +351,7 @@ func testCheckpointRestore(t *testing.T, conf *config.Config, compression statef
 	}
 	defer cont3.Destroy()
 
-	if err := cont3.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+	if err := cont3.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -564,7 +564,7 @@ func TestCheckpointRestoreHostname(t *testing.T) {
 			}
 			defer cont2.Destroy()
 
-			if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false, sandbox.BackgroundLoadEager, nil); err != nil {
+			if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil); err != nil {
 				t.Fatalf("error restoring: %v", err)
 			}
 
@@ -693,7 +693,7 @@ func testCheckpointRestoreHostinet(t *testing.T, conf *config.Config, app string
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 	if !cont2.Sandbox.Restored {
@@ -855,7 +855,7 @@ func TestCheckpointHostinetRestoreNetworkMismatch(t *testing.T) {
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	err = cont2.Restore(&restoreConf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */)
+	err = cont2.Restore(&restoreConf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */)
 	if err == nil {
 		t.Fatalf("restore with mismatched network type succeeded, want error")
 	}
@@ -963,7 +963,7 @@ func TestCheckpointRestoreExecKilled(t *testing.T) {
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -1048,7 +1048,7 @@ func TestCheckpointRestoreCreateMountPoint(t *testing.T) {
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -1126,7 +1126,7 @@ func TestCheckpointRestoreInodeNumbers(t *testing.T) {
 		t.Fatalf("error creating container: %v", err)
 	}
 	defer cont2.Destroy()
-	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 
@@ -1372,7 +1372,7 @@ func TestSplitFSCheckpointRestore(t *testing.T) {
 			}
 			defer cont2.Destroy()
 
-			if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, dir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -1681,7 +1681,7 @@ func TestPartialSplitFSCheckpointRestore(t *testing.T) {
 			cont2 := newContainer(t, conf, spec, bundleDir, func(args *Args) {
 				args.CheckpointDirPath = checkpointDir
 			})
-			if err := cont2.Restore(conf, checkpointDir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, checkpointDir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -1781,7 +1781,7 @@ func TestSplitFSCheckpointRestoreOnlyFS(t *testing.T) {
 				contRestore := newContainer(t, conf, spec, bundleDir, func(args *Args) {
 					args.FSRestoreImagePaths = []string{onlyFSDir}
 				})
-				if err := contRestore.Restore(conf, sentryOnlyDir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+				if err := contRestore.Restore(conf, sentryOnlyDir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 					t.Fatalf("error restoring container with isolated fs checkpoint: %v", err)
 				}
 
@@ -1794,7 +1794,7 @@ func TestSplitFSCheckpointRestoreOnlyFS(t *testing.T) {
 				contRestore := newContainer(t, conf, spec, bundleDir, func(args *Args) {
 					args.FSRestoreImagePaths = []string{filepath.Join(onlyFSDir, tc.wantPrefix)}
 				})
-				if err := contRestore.Restore(conf, sentryOnlyDir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+				if err := contRestore.Restore(conf, sentryOnlyDir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 					t.Fatalf("error restoring container with explicit <dir>/<prefix> fs checkpoint: %v", err)
 				}
 
@@ -1872,7 +1872,7 @@ func TestCheckpointRestoreTUN(t *testing.T) {
 			}
 			defer cont2.Destroy()
 
-			if err := cont2.Restore(conf, checkpointDir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, checkpointDir, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -1914,7 +1914,7 @@ func TestCheckpointRestoreTUN(t *testing.T) {
 			}
 			defer cont3.Destroy()
 
-			if err := cont3.Restore(conf, checkpointDir2, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+			if err := cont3.Restore(conf, checkpointDir2, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 				t.Fatalf("error restoring container a second time: %v", err)
 			}
 
@@ -2097,7 +2097,7 @@ func (e *splitFSTestEnv) restore(t *testing.T, imagePath string, mutateArgs func
 	restoreOne := func(spec *specs.Spec, mutateArgs func(*Args)) *Container {
 		t.Helper()
 		c := newContainer(t, e.conf, spec, newBundleDir(t, spec), mutateArgs)
-		if err := c.Restore(e.conf, imagePath, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+		if err := c.Restore(e.conf, imagePath, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 			t.Fatalf("error restoring container: %v", err)
 		}
 		return c
@@ -2349,7 +2349,7 @@ func runAdjustedTSCTest(t *testing.T, conf *config.Config, count int, offsetCycl
 	}
 	defer cont2.Destroy()
 
-	if err := cont2.Restore(conf, dir1, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+	if err := cont2.Restore(conf, dir1, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring second container: %v", err)
 	}
 
@@ -2392,7 +2392,7 @@ func runAdjustedTSCTest(t *testing.T, conf *config.Config, count int, offsetCycl
 	}
 	defer cont3.Destroy()
 
-	if err := cont3.Restore(conf, dir2, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, nil /* networkArgs */); err != nil {
+	if err := cont3.Restore(conf, dir2, sandbox.DirectIOOff, false /* background */, sandbox.BackgroundLoadEager, false /* deferCheckpoint */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring third container: %v", err)
 	}
 
